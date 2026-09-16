@@ -1,1 +1,22 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Dữ liệu sinh ra khi chạy
+*.db
+*.sqlite3
+*.log
+experiments/out/
 /docs
