@@ -20,3 +20,6 @@ Thumbs.db
 *.log
 experiments/out/
 /docs
+
+# Model MediaPipe tải về (3.7 MB) — không commit, chạy: python scripts/fetch_models.py
+host/**/models/*.task
