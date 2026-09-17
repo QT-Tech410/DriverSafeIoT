@@ -109,10 +109,10 @@ Depends: `VIS-04`
 Tổng hợp các chỉ số Vision ở tầng thời gian và publish dữ liệu định kỳ 1Hz lên topic MQTT `ds/vision/metrics` đúng JSON schema đã thống nhất với Phần A.
 
 ### Acceptance Criteria:
-- [ ] File: `host/vision/publisher.py`
-- [ ] Kế thừa Paho MQTT Client, kết nối tới Mosquitto Broker local
-- [ ] Publish gói tin 1Hz lên `ds/vision/metrics` với QoS 0
-- [ ] Payload JSON chứa đủ các trường: `ts`, `face`, `ear`, `perclos_60s`, `cles_dur_ms`, `mar`, `yawn_per_min`, `head_pitch_deg`, `head_drop`, `lux_mode`
+- [x] File: `host/vision/publisher.py`
+- [x] Kế thừa Paho MQTT Client, kết nối tới Mosquitto Broker local
+- [x] Publish gói tin 1Hz lên `ds/vision/metrics` với QoS 0
+- [x] Payload JSON chứa đủ các trường: `ts`, `face`, `ear`, `perclos_60s`, `cles_dur_ms`, `mar`, `yawn_per_min`, `head_pitch_deg`, `head_drop`, `lux_mode`
 
 ---
 
