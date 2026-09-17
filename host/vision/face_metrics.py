@@ -1,4 +1,4 @@
-"""Face Mesh — bắt 468 điểm landmark khuôn mặt và vẽ overlay.
+"""Face Mesh + chỉ số hình học — 468 điểm landmark, EAR/MAR/Pitch (VIS-02 + VIS-03).
 
 LƯU Ý QUAN TRỌNG VỀ PHIÊN BẢN
 -----------------------------
@@ -8,8 +8,13 @@ API thay thế là `mediapipe.tasks.python.vision.FaceLandmarker`, và nó cần
 file model `.task` tải riêng (khác bản 0.10.x vốn bundle sẵn model):
     python scripts/fetch_models.py
 
+Các chỉ số (spec §6.2):
+  - EAR = (|P2-P6| + |P3-P5|) / (2*|P1-P4|), chuẩn hóa theo khoảng cách 2 mắt
+  - MAR = |P_lips_ver| / |P_lips_hor| (chuẩn hóa tương tự)
+  - Pitch  từ cv2.solvePnP với 5 điểm mặt 3D -> Euler pitch
+
 Chạy thử:
-    python face_metrics.py                      # webcam, ve overlay
+    python face_metrics.py                      # webcam, ve overlay + chi so
     python face_metrics.py --src mjpeg --url http://<ip>:81/stream
     python face_metrics.py --headless --duration 10
 Phím: q/ESC thoát, t = bật/tắt tesselation (nặng), s = chụp ảnh
@@ -59,6 +64,29 @@ MOUTH_HORIZONTAL = (61, 291)
 EYE_OUTER_RIGHT = 33
 EYE_OUTER_LEFT = 263
 
+# --- Head pose: 5 điểm mặt 3D mô hình hóa (spec §6.2) cho cv2.solvePnP ---
+# Convention camera OpenCV: x sang phai, y XUONG, z ve phia camera.
+# Dung convention nay (chu khong phai y-len nhu toa do 3D thong thuong) thi
+# mat nhin thang cho R = don vi, cong thuc Euler pitch = atan2(R21, R22) = 0.
+HEAD_POSE_3D = np.array([
+    [-0.045, -0.025, -0.040],   # mat phai (xuat hien ben trai anh)
+    [ 0.045, -0.025, -0.040],   # mat trai
+    [ 0.000,  0.000,  0.035],   # chop mui (gan camera nhat)
+    [-0.028,  0.030, -0.015],   # memp mieng phai
+    [ 0.028,  0.030, -0.015],   # memp mieng trai
+], dtype=np.float64)
+HEAD_POSE_2D_IDX = (EYE_OUTER_RIGHT, EYE_OUTER_LEFT, 1, 61, 291)
+
+# Một số đối số kỹ thuật: CV_CALIB_USE_INTRINSIC_GUESS phải đi cùng ma trận K + distortion.
+# Camera 640x480 tiêu chuẩn: f ≈ fx = fy = 500 (góc nhìn ~57°), điểm chính giữa khung.
+_DEFAULT_K = np.array([
+    [500.0,   0.0, 320.0],
+    [  0.0, 500.0, 240.0],
+    [  0.0,   0.0,   1.0],
+], dtype=np.float64)
+_DEFAULT_DIST = np.zeros(5, dtype=np.float64)
+
+
 # --- Màu overlay (BGR) ---
 C_OVAL = (0, 220, 0)
 C_EYE = (255, 200, 0)
@@ -88,7 +116,117 @@ class FaceResult:
         return self.landmarks_px[index]
 
 
-_UNSET = FaceResult(present=False)
+@dataclass
+class GeoMetrics:
+    """Các chỉ số hình học 1 frame (spec §6.2) — tất cả đều không thứ nguyên."""
+
+    ear_right: float        # EAR mắt phải (tỷ lệ, chưa chuẩn hóa)
+    ear_left: float
+    ear: float              # trung bình 2 mắt — dùng cho EAR_norm
+    ear_norm: float         # chuẩn hóa theo khoảng cách 2 mắt (spec §6.2)
+    mar: float              # MAR đã chuẩn hóa
+    pitch_deg: float        # Euler pitch từ solvePnP, độ
+    head_ok: bool           # solvePnP hội tụ không
+
+    def as_dict(self) -> dict:
+        return {
+            "ear": round(self.ear, 4),
+            "ear_norm": round(self.ear_norm, 4),
+            "mar": round(self.mar, 4),
+            "pitch_deg": round(self.pitch_deg, 1),
+            "head_ok": self.head_ok,
+        }
+
+
+_NO_FACE_GEO = GeoMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, False)
+
+
+def _segment_length(pts: np.ndarray, i: int, j: int) -> float:
+    """Khoảng cách Euclid giữa 2 landmark (dạng pixel float)."""
+    return float(np.linalg.norm(pts[i] - pts[j]))
+
+
+def compute_ear(pts: np.ndarray) -> tuple[float, float, float, float]:
+    """EAR mắt phải / trái / trung bình, và cả bản chuẩn hóa (spec §6.2).
+
+    Công thức:  EAR = (|P2-P6| + |P3-P5|) / (2 * |P1-P4|)
+    P1..P6 theo RIGHT_EYE_P1_P6 / LEFT_EYE_P1_P6 (P1/P4 = góc mắt,
+    P2/P3 = mí trên, P5/P6 = mí dưới).
+    Trả về (ear_right, ear_left, ear_avg, ear_norm) — ear_norm = ear_avg / inter-eye.
+    """
+    inter_eye = _segment_length(pts, EYE_OUTER_RIGHT, EYE_OUTER_LEFT)
+
+    def one_eye(idxs: tuple[int, ...]) -> float:
+        p1, p2, p3, p4, p5, p6 = idxs
+        vertical = _segment_length(pts, p2, p6) + _segment_length(pts, p3, p5)
+        horizontal = 2.0 * _segment_length(pts, p1, p4)
+        if horizontal < 1e-6:
+            return 0.0
+        return vertical / horizontal
+
+    ear_r = one_eye(RIGHT_EYE_P1_P6)
+    ear_l = one_eye(LEFT_EYE_P1_P6)
+    ear = 0.5 * (ear_r + ear_l)
+    ear_norm = ear / inter_eye if inter_eye > 1e-6 else 0.0
+    return ear_r, ear_l, ear, ear_norm
+
+
+def compute_mar(pts: np.ndarray) -> float:
+    """MAR chuẩn hóa (spec §6.2): |P_lips_ver| / |P_lips_hor| / inter-eye.
+
+    MAR thuần = |13-14| / |61-291| là một tỷ lệ không thứ nguyên nên đã độc lập
+    kích thước mặt; thêm 1 lần chia inter-eye nữa theo đúng công thức spec.
+    """
+    inter_eye = _segment_length(pts, EYE_OUTER_RIGHT, EYE_OUTER_LEFT)
+    ver = _segment_length(pts, MOUTH_VERTICAL[0], MOUTH_VERTICAL[1])
+    hor = _segment_length(pts, MOUTH_HORIZONTAL[0], MOUTH_HORIZONTAL[1])
+    if hor < 1e-6 or inter_eye < 1e-6:
+        return 0.0
+    return (ver / hor) / inter_eye
+
+
+def compute_pitch(pts: np.ndarray, image_size: tuple[int, int],
+                  camera_matrix: np.ndarray = _DEFAULT_K,
+                  dist_coeffs: np.ndarray = _DEFAULT_DIST) -> tuple[float, bool]:
+    """Euler pitch (độ) từ cv2.solvePnP với 5 điểm mặt 3D (spec §6.2).
+
+    Trả về (pitch_deg, ok). ok=False khi solvePnP không hội tụ.
+    Quy ước: pitch dương = ngửa đầu lên, âm = cúi xuống.
+    """
+    if pts.shape[0] <= max(HEAD_POSE_2D_IDX):
+        return 0.0, False
+
+    image_points = pts[list(HEAD_POSE_2D_IDX)].astype(np.float64)
+    # Ma trận K phải khớp với kích thước ảnh thực (điểm chính giữa khung).
+    k = camera_matrix.copy()
+    k[0, 2] = image_size[0] / 2.0
+    k[1, 2] = image_size[1] / 2.0
+
+    # Spec §6.2 cho 5 điểm (2 mắt, mũi, 2 mép miệng) — các thuật toán SolvePnP
+    # thông thường (ITERATIVE/DLT) cần >= 6 điểm. IPPE lại chỉ nhận đúng 4 điểm.
+    # SQPNP: hỗ trợ 5+ điểm, ổn định với bộ điểm coplanar như của ta.
+    ok, _rvec, _tvec = cv2.solvePnP(
+        HEAD_POSE_3D, image_points, k, dist_coeffs, flags=cv2.SOLVEPNP_SQPNP
+    )
+    if not ok:
+        return 0.0, False
+
+    # Chuyển rotation vector -> rotation matrix -> Euler pitch (trục X).
+    rmat, _ = cv2.Rodrigues(_rvec)
+    # Chuẩn hóa để tránh ảnh hưởng bởi lỗi số.
+    pitch = np.arctan2(rmat[2, 1], rmat[2, 2])
+    return float(np.degrees(pitch)), True
+
+
+def compute_geo_metrics(result: FaceResult, image_size: tuple[int, int]) -> GeoMetrics:
+    """Tính toàn bộ EAR/MAR/pitch từ 1 FaceResult. Trả về 0 khi không có mặt."""
+    if not result.present or result.landmarks_px is None:
+        return _NO_FACE_GEO
+    pts = result.landmarks_px
+    _er, _el, ear, ear_norm = compute_ear(pts)
+    mar = compute_mar(pts)
+    pitch, head_ok = compute_pitch(pts, image_size)
+    return GeoMetrics(_er, _el, ear, ear_norm, mar, pitch, head_ok)
 
 
 class FaceMesh:
@@ -193,6 +331,29 @@ def _draw_connections(
         cv2.line(frame, tuple(pts_i[c.start]), tuple(pts_i[c.end]), color, thickness, cv2.LINE_AA)
 
 
+def draw_metrics(frame: np.ndarray, result: FaceResult, geo: GeoMetrics) -> np.ndarray:
+    """Vẽ bảng chỉ số EAR/MAR/Pitch lên góc trái (overlay trong RAM)."""
+    lines = [
+        f"EAR    {geo.ear:.3f}  norm {geo.ear_norm:.3f}",
+        f"MAR    {geo.mar:.3f}",
+        f"PITCH  {geo.pitch_deg:+6.1f} deg" + ("" if geo.head_ok else " (PnP fail)"),
+    ]
+    y = 40
+    for text in lines:
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        cv2.rectangle(frame, (8, y - 4), (16 + tw, y + th + 6), (0, 0, 0), -1)
+        cv2.putText(frame, text, (12, y + th), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+        y += th + 14
+    if not result.present:
+        text = "NO FACE — metrics = 0"
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        cv2.rectangle(frame, (8, y - 4), (16 + tw, y + th + 6), (0, 0, 0), -1)
+        cv2.putText(frame, text, (12, y + th), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (0, 0, 255), 1, cv2.LINE_AA)
+    return frame
+
+
 def draw_landmarks(
     frame: np.ndarray,
     result: FaceResult,
@@ -284,6 +445,8 @@ def main(argv: list[str] | None = None) -> int:
     seen_face = frames_seen = 0
     n_landmarks = 0
     last_report = t_start
+    # Lưu 1 giá trị EAR_norm gần nhất để in ra dong ket thuc.
+    last_ear = last_mar = 0.0
 
     print("[face_metrics] q/ESC thoat, t tesselation, s chup anh" if not args.headless else "[face_metrics] headless")
     try:
@@ -300,17 +463,22 @@ def main(argv: list[str] | None = None) -> int:
             if result.present:
                 seen_face += 1
                 n_landmarks = result.count
+                last_ear = geo.ear
+                last_mar = geo.mar
+            geo = compute_geo_metrics(result, (frame.shape[1], frame.shape[0]))
 
             if args.headless:
                 now = time.perf_counter()
                 if now - last_report >= 1.0:
                     pct = 100.0 * seen_face / frames_seen if frames_seen else 0.0
                     print(f"[face_metrics] FPS {meter.fps:5.1f} | face {seen_face}/{frames_seen} "
-                          f"({pct:4.0f}%) | pts={n_landmarks}")
+                          f"({pct:4.0f}%) | pts={n_landmarks} | EAR {geo.ear:.3f} "
+                          f"MAR {geo.mar:.3f} pitch {geo.pitch_deg:+.1f}")
                     last_report = now
             else:
                 draw_landmarks(frame, result, tesselation=tesselation)
                 draw_status(frame, result)
+                draw_metrics(frame, result, geo)
                 cv2.imshow("DriverSafe-IoT | face mesh",
                            draw_hud(frame, meter.fps, src_label))
                 key = cv2.waitKey(1) & 0xFF
@@ -333,7 +501,8 @@ def main(argv: list[str] | None = None) -> int:
     elapsed = time.perf_counter() - t_start
     pct = 100.0 * seen_face / frames_seen if frames_seen else 0.0
     print(f"[face_metrics] ket thuc: {frames_seen} frame / {elapsed:.1f}s | "
-          f"FPS {meter.fps_avg:.1f} | bat mat {pct:.0f}%")
+          f"FPS {meter.fps_avg:.1f} | bat mat {pct:.0f}% | "
+          f"EAR {last_ear:.3f} MAR {last_mar:.3f}")
     return 0
 
 
