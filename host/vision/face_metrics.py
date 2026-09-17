@@ -118,13 +118,23 @@ class FaceResult:
 
 @dataclass
 class GeoMetrics:
-    """Các chỉ số hình học 1 frame (spec §6.2) — tất cả đều không thứ nguyên."""
+    """Các chỉ số hình học 1 frame (spec §6.2) — tất cả đều không thứ nguyên.
 
-    ear_right: float        # EAR mắt phải (tỷ lệ, chưa chuẩn hóa)
+    LƯU Ý VỀ "chuẩn hóa" (đã kiểm chứng thực nghiệm VIS-03/VIS-04):
+    `_norm` = metric / inter-eye mang đơn vị px⁻¹ nên PHỤ THUỘC khoảng cách
+    camera — đưa tay ra xa/lại gần là đổi giá trị, không thể so với 1 ngưỡng
+    cố định. Còn bản không chia (ear, mar) vốn đã là tỷ lệ của 2 đoạn cùng
+    tỉ lệ với khoảng cách camera → bất biến thứ nguyên, mới dùng để so ngưỡng.
+    Do đó cả 2 bản đều được tính (bản `_norm` báo cáo cho đủ schema), nhưng
+    lớp thời gian và các ngưỡng T_closed/T_yawn dùng bản không thứ nguyên.
+    """
+
+    ear_right: float        # EAR mắt phải (tỷ lệ, không thứ nguyên)
     ear_left: float
-    ear: float              # trung bình 2 mắt — dùng cho EAR_norm
+    ear: float              # trung bình 2 mắt — DÙNG CHO T_closed
     ear_norm: float         # chuẩn hóa theo khoảng cách 2 mắt (spec §6.2)
-    mar: float              # MAR đã chuẩn hóa
+    mar: float              # MAR thuần (v/h) — DÙNG CHO T_yawn
+    mar_norm: float         # chuẩn hóa theo khoảng cách 2 mắt (spec §6.2)
     pitch_deg: float        # Euler pitch từ solvePnP, độ
     head_ok: bool           # solvePnP hội tụ không
 
@@ -133,12 +143,13 @@ class GeoMetrics:
             "ear": round(self.ear, 4),
             "ear_norm": round(self.ear_norm, 4),
             "mar": round(self.mar, 4),
+            "mar_norm": round(self.mar_norm, 4),
             "pitch_deg": round(self.pitch_deg, 1),
             "head_ok": self.head_ok,
         }
 
 
-_NO_FACE_GEO = GeoMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, False)
+_NO_FACE_GEO = GeoMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, False)
 
 
 def _segment_length(pts: np.ndarray, i: int, j: int) -> float:
@@ -171,18 +182,20 @@ def compute_ear(pts: np.ndarray) -> tuple[float, float, float, float]:
     return ear_r, ear_l, ear, ear_norm
 
 
-def compute_mar(pts: np.ndarray) -> float:
-    """MAR chuẩn hóa (spec §6.2): |P_lips_ver| / |P_lips_hor| / inter-eye.
+def compute_mar(pts: np.ndarray) -> tuple[float, float]:
+    """MAR (spec §6.2): |P_lips_ver| / |P_lips_hor|, kèm bản chuẩn hóa.
 
-    MAR thuần = |13-14| / |61-291| là một tỷ lệ không thứ nguyên nên đã độc lập
-    kích thước mặt; thêm 1 lần chia inter-eye nữa theo đúng công thức spec.
+    Trả về (mar, mar_norm). mar_norm = mar / inter-eye (đúng công thức chữ
+    của spec), nhưng mar mới là đầu vào so ngưỡng — xem GeoMetrics để biết lý do.
     """
     inter_eye = _segment_length(pts, EYE_OUTER_RIGHT, EYE_OUTER_LEFT)
     ver = _segment_length(pts, MOUTH_VERTICAL[0], MOUTH_VERTICAL[1])
     hor = _segment_length(pts, MOUTH_HORIZONTAL[0], MOUTH_HORIZONTAL[1])
-    if hor < 1e-6 or inter_eye < 1e-6:
-        return 0.0
-    return (ver / hor) / inter_eye
+    if hor < 1e-6:
+        return 0.0, 0.0
+    mar = ver / hor
+    mar_norm = mar / inter_eye if inter_eye > 1e-6 else 0.0
+    return mar, mar_norm
 
 
 def compute_pitch(pts: np.ndarray, image_size: tuple[int, int],
@@ -213,7 +226,8 @@ def compute_pitch(pts: np.ndarray, image_size: tuple[int, int],
 
     # Chuyển rotation vector -> rotation matrix -> Euler pitch (trục X).
     rmat, _ = cv2.Rodrigues(_rvec)
-    # Chuẩn hóa để tránh ảnh hưởng bởi lỗi số.
+    # Đã kiểm chứng thực nghiệm (VIS-03): nhìn thẳng ≈ 0, cúi đầu → âm,
+    # ngẩng đầu → dương. Khớp quy ước "pitch dương = ngửa đầu lên".
     pitch = np.arctan2(rmat[2, 1], rmat[2, 2])
     return float(np.degrees(pitch)), True
 
@@ -224,9 +238,9 @@ def compute_geo_metrics(result: FaceResult, image_size: tuple[int, int]) -> GeoM
         return _NO_FACE_GEO
     pts = result.landmarks_px
     _er, _el, ear, ear_norm = compute_ear(pts)
-    mar = compute_mar(pts)
+    mar, mar_norm = compute_mar(pts)
     pitch, head_ok = compute_pitch(pts, image_size)
-    return GeoMetrics(_er, _el, ear, ear_norm, mar, pitch, head_ok)
+    return GeoMetrics(_er, _el, ear, ear_norm, mar, mar_norm, pitch, head_ok)
 
 
 class FaceMesh:
@@ -335,7 +349,7 @@ def draw_metrics(frame: np.ndarray, result: FaceResult, geo: GeoMetrics) -> np.n
     """Vẽ bảng chỉ số EAR/MAR/Pitch lên góc trái (overlay trong RAM)."""
     lines = [
         f"EAR    {geo.ear:.3f}  norm {geo.ear_norm:.3f}",
-        f"MAR    {geo.mar:.3f}",
+        f"MAR    {geo.mar:.3f}  norm {geo.mar_norm:.4f}",
         f"PITCH  {geo.pitch_deg:+6.1f} deg" + ("" if geo.head_ok else " (PnP fail)"),
     ]
     y = 40
@@ -460,12 +474,13 @@ def main(argv: list[str] | None = None) -> int:
 
             ts_ms = int((time.perf_counter() - t_start) * 1000)
             result = mesh.process(frame, ts_ms)
+            # Tính chỉ số trước khi đọc: frame đầu có thể không có mặt.
+            geo = compute_geo_metrics(result, (frame.shape[1], frame.shape[0]))
             if result.present:
                 seen_face += 1
                 n_landmarks = result.count
                 last_ear = geo.ear
                 last_mar = geo.mar
-            geo = compute_geo_metrics(result, (frame.shape[1], frame.shape[0]))
 
             if args.headless:
                 now = time.perf_counter()
