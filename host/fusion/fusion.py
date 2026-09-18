@@ -27,6 +27,13 @@ import paho.mqtt.client as mqtt
 # Cho phép import các module cùng cấp trong thư mục host/fusion
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import FusionConfig, load_config  # noqa: E402
+from policy import (  # noqa: E402
+    FusionResult,
+    RuleWeightedPolicy,
+    TOPIC_ESP32_CMD,
+    TOPIC_EVENTS,
+    TOPIC_FUSION_LEVEL,
+)
 
 # Topic MQTT theo chuẩn spec §5 / spec §6.1
 TOPIC_ESP32_SENSORS = "ds/esp32/sensors"
@@ -221,6 +228,7 @@ class FusionSubscriber(mqtt.Client):
         cache: TelemetryCache | None = None,
         vision_timeout_s: float | None = None,
         esp32_timeout_s: float | None = None,
+        policy: RuleWeightedPolicy | None = None,
     ) -> None:
         if _CALLBACK_API is not None:
             super().__init__(_CALLBACK_API, client_id=client_id)
@@ -233,6 +241,10 @@ class FusionSubscriber(mqtt.Client):
             vision_timeout_s=vision_timeout_s,
             esp32_timeout_s=esp32_timeout_s,
         )
+        self.policy = policy or RuleWeightedPolicy()
+        self.level_publish_count = 0
+        self.cmd_publish_count = 0
+        self.last_fusion_result: FusionResult | None = None
 
         # Hooks cho module Fusion Engine (FUS-02 / FUS-03)
         self.on_vision_update: Callable[[VisionTelemetry], None] | None = None
@@ -331,9 +343,52 @@ class FusionSubscriber(mqtt.Client):
         except Exception:
             pass
 
+    def step_fusion(self) -> FusionResult:
+        """Thực hiện 1 chu kỳ suy luận Fusion, publish ds/fusion/level (QoS1 retain) và phát lệnh ds/esp32/cmd."""
+        v_dict = self.cache.vision.as_dict() if self.cache.vision else None
+        e_dict = self.cache.esp32.as_dict() if self.cache.esp32 else None
+        v_online = self.cache.is_vision_online()
+        e_online = self.cache.is_esp32_online()
+
+        res = self.policy.evaluate(
+            vision_data=v_dict,
+            esp32_data=e_dict,
+            vision_online=v_online,
+            esp32_online=e_online,
+        )
+        self.last_fusion_result = res
+
+        # Publish ds/fusion/level (QoS 1, retain=True theo spec §5, §8)
+        lvl_payload = json.dumps(res.as_level_payload())
+        self.publish(TOPIC_FUSION_LEVEL, lvl_payload, qos=1, retain=True)
+        self.level_publish_count += 1
+
+        # Phát lệnh ds/esp32/cmd và log ds/events nếu có lệnh
+        if res.cmd_payload is not None:
+            cmd_str = json.dumps(res.cmd_payload)
+            self.publish(TOPIC_ESP32_CMD, cmd_str, qos=1)
+            self.cmd_publish_count += 1
+            print(f"\n>>> [FUSION PHAT LENH] {cmd_str} (Risk={res.risk}, Band={res.band}, Drivers={res.drivers})")
+
+            # Log sự kiện cảnh báo lên ds/events (spec §5, §9)
+            evt_dict = {
+                "ts": res.ts,
+                "risk": res.risk,
+                "band": res.band,
+                "drivers": res.drivers,
+                "cmd": res.cmd_payload,
+                "metrics": {
+                    "vision": v_dict,
+                    "esp32": e_dict,
+                },
+            }
+            self.publish(TOPIC_EVENTS, json.dumps(evt_dict), qos=1)
+
+        return res
+
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Fusion Telemetry Ingestion Node (FUS-01)")
+    parser = argparse.ArgumentParser(description="Fusion Telemetry Ingestion & Engine Node (FUS-01/02)")
     parser.add_argument("--host", default="127.0.0.1", help="Mosquitto broker host (override config)")
     parser.add_argument("--port", type=int, default=1883, help="Mosquitto broker port (override config)")
     parser.add_argument("--config", default=None, help="Path to config.yaml (default: autodetect)")
@@ -358,11 +413,11 @@ def main(argv: list[str] | None = None) -> int:
         esp32_timeout_s=cfg.esp32_timeout_s,
     )
 
-    print(f"[fusion.ingestion] Dang ket noi Mosquitto broker tai {broker_host}:{broker_port}...")
+    print(f"[fusion.engine] Dang ket noi Mosquitto broker tai {broker_host}:{broker_port}...")
     if not sub.connect_broker(timeout=3.0):
-        print(f"[fusion.ingestion] CANH BAO: Chua ket noi duoc broker {broker_host}:{broker_port}", file=sys.stderr)
+        print(f"[fusion.engine] CANH BAO: Chua ket noi duoc broker {broker_host}:{broker_port}", file=sys.stderr)
 
-    print("[fusion.ingestion] Da san sang lang nghe 3 luong du lieu. Nhan Ctrl+C de dung.\n")
+    print("[fusion.engine] Da san sang thuc hien suy luan Fusion 1Hz. Nhan Ctrl+C de dung.\n")
 
     t_start = time.perf_counter()
     try:
@@ -370,33 +425,30 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(1.0)
             now = time.perf_counter()
 
-            # Trạng thái Vision
+            # Thực hiện chu kỳ suy luận Fusion và publish ds/fusion/level + ds/esp32/cmd
+            res = sub.step_fusion()
+
             v_ok = cache.is_vision_online()
-            if v_ok and cache.vision:
-                v_str = f"ONLINE (P78:{cache.vision.perclos_60s*100:4.1f}%, EAR:{cache.vision.ear:.3f}, CLES:{cache.vision.cles_dur_ms:.0f}ms)"
-            else:
-                v_str = "OFFLINE (>2s)"
-
-            # Trạng thái ESP32
             e_ok = cache.is_esp32_online()
-            if e_ok and cache.esp32:
-                e_str = f"ONLINE (BrAC:{cache.esp32.alcohol_g_l:.2f}g/L, T:{cache.esp32.temp_c}°C, LUX:{cache.esp32.lux_mode.upper()})"
-            else:
-                e_str = "OFFLINE (>5s)"
 
-            n_ev = len(cache.events)
-            print(f"[FUSION CACHE] Vision: {v_str:<45} | ESP32: {e_str:<45} | Events: {n_ev:02d}")
+            print(
+                f"[FUSION 1Hz #{sub.level_publish_count:03d}] "
+                f"RISK: {res.risk:4.1f} ({res.band:<8}) | "
+                f"Drivers: {str(res.drivers):<28} | "
+                f"Action: {res.action:<12} | "
+                f"Vision:{'ON' if v_ok else 'OFF'} ESP:{'ON' if e_ok else 'OFF'}"
+            )
 
             if args.duration > 0 and (now - t_start) >= args.duration:
-                print(f"\n[fusion.ingestion] Da chay het thoi gian dinh san ({args.duration}s).")
+                print(f"\n[fusion.engine] Da chay het thoi gian dinh san ({args.duration}s).")
                 break
 
     except KeyboardInterrupt:
-        print("\n[fusion.ingestion] Dung boi nguoi dung (Ctrl+C).")
+        print("\n[fusion.engine] Dung boi nguoi dung (Ctrl+C).")
     finally:
         sub.disconnect_broker()
 
-    print("[fusion.ingestion] Da dung tien trinh an toan.")
+    print("[fusion.engine] Da dung tien trinh an toan.")
     return 0
 
 
