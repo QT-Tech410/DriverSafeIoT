@@ -1,31 +1,39 @@
-"""Rule-Weighted Temporary Fusion Engine & Action Policy (FUS-02).
+"""Fusion Policy Engine & Algorithm Dispatcher (FUS-02 / FUS-03 / FUS-04).
 
-Tính toán Risk Score 0–100 theo công thức Rule-Weighted tạm (spec §11, FUS-02):
-    Risk = w1·PERCLOS + w2·blink_events + w3·ALCO + w4·CABIN
-
-Phân dải Risk thành 4 band chính xác:
-    - SAFE     (< 25):   Bình thường, log trạng thái
-    - WARN     (25–50):  Cảnh báo mệt mỏi/nhiệt độ nhẹ, beep 1 nhát
-    - ALARM    (50–75):  Nguy cơ cao, buzzer 3 nhịp + LED đỏ
-    - CRITICAL (> 75):   Khẩn cấp:
-                         + Nếu rủi ro do Cồn (ALCO=2) -> Khóa động cơ ({"cmd":"lock"})
-                         + Nếu rủi ro do Mệt mỏi -> KHÔNG khóa, chỉ cảnh báo ("NGUNG LAI NGAY")
-
-Quản lý cooldown giữa các lệnh gửi cho ESP32 và hỗ trợ fallback khi vision_offline.
+Module phụ trách suy luận Risk Score 0–100 và điều phối chính sách an toàn:
+- Hỗ trợ 2 phương pháp suy luận:
+  1. MamdaniPolicy: Động cơ suy luận mờ Mamdani 6 inputs, 12 rules (chính thức, FUS-03).
+  2. RuleWeightedPolicy: Động cơ xấp xỉ tuyến tính theo trọng số (dự phòng, FUS-02).
+- Tích hợp SafetyEnforcer (enforcer.py) để thực thi chính sách khóa xe 2/3 lần đo,
+  chống khóa xe khi mệt mỏi và quản lý cooldown phát lệnh MQTT.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 import time
 from typing import Literal
 
-BandType = Literal["SAFE", "WARN", "ALARM", "CRITICAL"]
+# Tách riêng module enforcer để tuân thủ kiến trúc chia nhỏ Single Responsibility
+from enforcer import BandType, SafetyEnforcer
 
-# Topic MQTT (spec §5)
+# Topic MQTT theo chuẩn spec §5
 TOPIC_FUSION_LEVEL = "ds/fusion/level"
 TOPIC_ESP32_CMD = "ds/esp32/cmd"
 TOPIC_EVENTS = "ds/events"
+
+# Re-export để đảm bảo tương thích ngược
+__all__ = [
+    "BandType",
+    "FusionResult",
+    "SafetyEnforcer",
+    "RuleWeightedPolicy",
+    "MamdaniPolicy",
+    "TOPIC_FUSION_LEVEL",
+    "TOPIC_ESP32_CMD",
+    "TOPIC_EVENTS",
+]
 
 
 @dataclass
@@ -36,7 +44,7 @@ class FusionResult:
     risk: float                # 0.0 - 100.0
     band: BandType             # SAFE, WARN, ALARM, CRITICAL
     drivers: list[str]         # ["perclos", "alcohol", "fatigue", "cabin", ...]
-    action: str                # "none", "beep_1", "beep_3", "lock", "stop_driving"
+    action: str                # "none", "beep_1", "beep_3", "lock", "stop_driving", "confirming_alco"
     cmd_payload: dict | None = None  # Gói tin gửi cho ds/esp32/cmd (nếu cần phát lệnh)
 
     def as_level_payload(self) -> dict:
@@ -51,7 +59,7 @@ class FusionResult:
 
 
 class RuleWeightedPolicy:
-    """Bộ suy luận Fusion dạng Rule-Weighted kèm Action Policy phân tầng."""
+    """Bộ suy luận Fusion dạng Rule-Weighted kèm Action Policy phân tầng (FUS-02/04)."""
 
     def __init__(
         self,
@@ -60,16 +68,17 @@ class RuleWeightedPolicy:
         w_alco: float = 0.30,
         w_cabin: float = 0.10,
         cooldown_s: float = 10.0,
+        enforcer: SafetyEnforcer | None = None,
     ) -> None:
         self.w_perclos = w_perclos
         self.w_blink = w_blink
         self.w_alco = w_alco
         self.w_cabin = w_cabin
-        self.cooldown_s = cooldown_s
-
-        self.last_action_ts: float = 0.0
-        self.last_band: BandType = "SAFE"
-        self.last_action: str = "none"
+        self.enforcer = enforcer or SafetyEnforcer(
+            cooldown_warn_s=cooldown_s,
+            cooldown_alarm_s=cooldown_s * 0.8,
+            cooldown_critical_s=cooldown_s * 0.5,
+        )
 
     def scale_perclos(self, perclos_60s: float) -> float:
         """Ánh xạ PERCLOS 0 -> 40% lên thang điểm 0 -> 100 (spec §8)."""
@@ -83,18 +92,14 @@ class RuleWeightedPolicy:
     ) -> float:
         """Tính điểm rủi ro từ chớp mắt dài, microsleep, ngáp và cúi đầu."""
         score = 0.0
-        # Microsleep >= 500ms
         if cles_dur_ms >= 500.0:
             score = max(score, 100.0)
-        # Eye-closure >= 250ms
         elif cles_dur_ms >= 250.0:
             score = max(score, 60.0)
 
-        # Cúi đầu head_drop
         if head_drop:
             score = max(score, 80.0)
 
-        # Ngáp nhiều (>= 2 lần/phút)
         if yawn_per_min >= 2.0:
             score = max(score, 50.0)
         elif yawn_per_min >= 1.0:
@@ -103,12 +108,7 @@ class RuleWeightedPolicy:
         return score
 
     def scale_alcohol(self, alcohol_g_l: float) -> float:
-        """Ánh xạ nồng độ cồn lên thang điểm 0 -> 100 (spec §7.1.5).
-
-        ALCO=0: < 0.1 g/L -> điểm thấp (0-20)
-        ALCO=1: 0.1 - 0.3 g/L -> điểm vừa (50-70)
-        ALCO=2: > 0.3 g/L -> điểm tối đa (100)
-        """
+        """Ánh xạ nồng độ cồn lên thang điểm 0 -> 100 (spec §7.1.5)."""
         if alcohol_g_l >= 0.30:
             return 100.0
         if alcohol_g_l >= 0.10:
@@ -118,13 +118,11 @@ class RuleWeightedPolicy:
     def scale_cabin(self, temp_c: float, lux_mode: str, ldr_pct: int = 50) -> float:
         """Tính chỉ số CabinStress từ nhiệt độ NTC và ánh sáng LDR (spec §7.2, §7.3)."""
         stress = 0.0
-        # Nhiệt độ cabin: >35°C là NÓNG (spec §7.4 WARN); <16°C là LẠNH
         if temp_c >= 35.0:
             stress += 60.0
         elif temp_c <= 16.0:
             stress += 40.0
 
-        # Ánh sáng: dark / night làm tăng nguy cơ buồn ngủ khi lái xe đêm
         if lux_mode in ("dark", "night") or ldr_pct <= 20:
             stress += 40.0
         elif lux_mode == "dim" or ldr_pct <= 45:
@@ -142,7 +140,7 @@ class RuleWeightedPolicy:
     ) -> FusionResult:
         """Thực hiện suy luận Risk Score và xác định hành động chính sách."""
         now_ms = current_time_ms if current_time_ms is not None else int(time.time() * 1000)
-        now_s = time.time()
+        now_s = now_ms / 1000.0 if current_time_ms is not None else time.time()
 
         v_dict = vision_data or {}
         e_dict = esp32_data or {}
@@ -154,6 +152,7 @@ class RuleWeightedPolicy:
         yawn_val = float(v_dict.get("yawn_per_min", 0.0))
 
         alco_val = float(e_dict.get("alcohol_g_l", 0.0))
+        alco_lvl = int(e_dict.get("alco_level", 2 if alco_val >= 0.3 else (1 if alco_val >= 0.1 else 0)))
         temp_val = float(e_dict.get("temp_c", 25.0))
         lux_val = str(e_dict.get("lux_mode", "day"))
         ldr_val = int(e_dict.get("ldr_pct", 50))
@@ -176,13 +175,10 @@ class RuleWeightedPolicy:
             )
 
             # Quy tắc rủi ro mệt mỏi (Rule-Weighted Safety Overrides):
-            # Ngủ gật cực độ: Microsleep (>=500ms) kết hợp PERCLOS cao hoặc cúi đầu -> CRITICAL
             if (cles_val >= 500.0 or head_drop_val) and (s_perclos >= 65.0 or yawn_val >= 2.0):
                 risk = max(risk, 85.0)
-            # Mệt mỏi cao: PERCLOS cao kết hợp nhắm mắt dài (>=250ms) -> ALARM
             elif s_perclos >= 60.0 and s_blink >= 50.0:
                 risk = max(risk, 58.0)
-            # Sự kiện lẻ: Microsleep hoặc Head-drop đơn lẻ -> ALARM
             elif cles_val >= 500.0 or head_drop_val or s_perclos >= 75.0:
                 risk = max(risk, 55.0)
         else:
@@ -190,29 +186,28 @@ class RuleWeightedPolicy:
             risk = 0.75 * s_alco + 0.25 * s_cabin
             drivers.append("vision_offline")
 
-        # Cồn mức 2 (ALCO=2, >=0.3 g/L) luôn kích hoạt rủi ro khẩn cấp CRITICAL
-        if alco_val >= 0.30:
+        # Cồn mức 2 luôn kích hoạt rủi ro khẩn cấp CRITICAL
+        if alco_val >= 0.30 or alco_lvl >= 2:
             risk = max(risk, 85.0)
-        # Cồn mức 1 kết hợp mệt mỏi hoặc cabin nóng -> ALARM+
         elif alco_val >= 0.10 and (s_perclos >= 50.0 or s_cabin >= 50.0):
             risk = max(risk, 65.0)
 
         risk = max(0.0, min(100.0, round(risk, 1)))
 
         # 4. Xác định các nguyên nhân rủi ro chính (Drivers)
-        if s_alco >= 50.0:
+        if s_alco >= 50.0 or alco_val >= 0.10 or alco_lvl >= 1:
             drivers.append("alcohol")
         if vision_online:
             if s_perclos >= 40.0:
                 drivers.append("perclos")
-            if s_blink >= 50.0:
+            if s_blink >= 50.0 or cles_val >= 500.0 or head_drop_val:
                 drivers.append("fatigue")
         if s_cabin >= 50.0:
             drivers.append("cabin")
         if not drivers:
             drivers.append("normal")
 
-        # 5. Phân dải Risk thành 4 band chính xác
+        # 5. Phân dải Risk thành 4 band
         if risk < 25.0:
             band: BandType = "SAFE"
         elif risk < 50.0:
@@ -222,48 +217,14 @@ class RuleWeightedPolicy:
         else:
             band: BandType = "CRITICAL"
 
-        # 6. Action Policy & Safety Enforcement (spec §8, §7.1.5, §7.4)
-        action = "none"
-        cmd: dict | None = None
-
-        if band == "SAFE":
-            action = "none"
-            cmd = None
-        elif band == "WARN":
-            action = "beep_1"
-            cmd = {"cmd": "beep", "n": 1}
-        elif band == "ALARM":
-            action = "beep_3"
-            cmd = {"cmd": "beep", "n": 3}
-        elif band == "CRITICAL":
-            # Phân biệt rõ Alcohol vs Fatigue (spec §8):
-            # Khóa động cơ CHỈ KHI có cồn mức cao (ALCO >= 2)
-            if "alcohol" in drivers and alco_val >= 0.30:
-                action = "lock"
-                cmd = {"cmd": "lock", "sig": "1"}
-            else:
-                # Do buồn ngủ / mệt mỏi cực độ: Tuyệt đối KHÔNG khóa động cơ xe đang chạy!
-                action = "stop_driving"
-                cmd = {"cmd": "beep", "n": 5}
-
-        # 7. Quản lý Cooldown phát lệnh
-        # Chỉ gửi cmd nếu:
-        # - Đổi band (chuyển tầng nguy cơ), HOẶC
-        # - Đã qua thời gian cooldown_s
-        should_send_cmd = False
-        if cmd is not None:
-            if band != self.last_band:
-                should_send_cmd = True
-            elif (now_s - self.last_action_ts) >= self.cooldown_s:
-                should_send_cmd = True
-
-        if should_send_cmd:
-            self.last_action_ts = now_s
-        else:
-            cmd = None
-
-        self.last_band = band
-        self.last_action = action
+        # 6. Áp dụng SafetyEnforcer (xác nhận cồn 2/3 lần đo & cooldown)
+        action, cmd = self.enforcer.decide_action(
+            band=band,
+            drivers=drivers,
+            alco_val=alco_val,
+            alco_lvl=alco_lvl,
+            now_s=now_s,
+        )
 
         return FusionResult(
             ts=now_ms,
@@ -276,22 +237,23 @@ class RuleWeightedPolicy:
 
 
 class MamdaniPolicy:
-    """Bộ suy luận Fusion ứng dụng Fuzzy Mamdani Engine (§8 spec, FUS-03)."""
+    """Bộ suy luận Fusion ứng dụng Fuzzy Mamdani Engine & SafetyEnforcer (FUS-03/04)."""
 
     def __init__(
         self,
         rules_path: str | Path | None = None,
         cooldown_s: float = 10.0,
+        enforcer: SafetyEnforcer | None = None,
     ) -> None:
         from fuzzy import MamdaniEngine, normalize_inputs
 
         self.engine = MamdaniEngine(rules_path)
         self.normalize_inputs = normalize_inputs
-        self.cooldown_s = cooldown_s
-
-        self.last_action_ts: float = 0.0
-        self.last_band: BandType = "SAFE"
-        self.last_action: str = "none"
+        self.enforcer = enforcer or SafetyEnforcer(
+            cooldown_warn_s=cooldown_s,
+            cooldown_alarm_s=cooldown_s * 0.8,
+            cooldown_critical_s=cooldown_s * 0.5,
+        )
 
     def evaluate(
         self,
@@ -301,9 +263,9 @@ class MamdaniPolicy:
         esp32_online: bool = True,
         current_time_ms: int | float | None = None,
     ) -> FusionResult:
-        """Thực hiện suy luận Risk Score bằng Mamdani Fuzzy Engine và áp dụng Action Policy."""
+        """Thực hiện suy luận Risk Score bằng Mamdani Fuzzy Engine và áp dụng Action Policy an toàn."""
         now_ms = current_time_ms if current_time_ms is not None else int(time.time() * 1000)
-        now_s = time.time()
+        now_s = now_ms / 1000.0 if current_time_ms is not None else time.time()
 
         v_dict = vision_data or {}
         e_dict = esp32_data or {}
@@ -344,7 +306,7 @@ class MamdaniPolicy:
                 drivers.append("alcohol")
             if any(r in fired_ids for r in ("R1", "R2", "R4", "R5", "R6", "R7", "R10")):
                 drivers.append("perclos")
-            if any(r in fired_ids for r in ("R3", "R4", "R5")):
+            if any(r in fired_ids for r in ("R3", "R4", "R5")) or head_drop_val:
                 drivers.append("fatigue")
             if any(r in fired_ids for r in ("R6", "R9", "R11")):
                 drivers.append("cabin")
@@ -359,7 +321,7 @@ class MamdaniPolicy:
             if s_cabin >= 40.0:
                 drivers.append("cabin")
 
-        # Cồn mức 2 (ALCO=2, >=0.3 g/L) luôn kích hoạt rủi ro khẩn cấp CRITICAL
+        # Cồn mức 2 luôn kích hoạt rủi ro khẩn cấp CRITICAL
         if alco_val >= 0.30 or alco_lvl >= 2:
             risk = max(risk, 85.0)
             if "alcohol" not in drivers:
@@ -378,44 +340,14 @@ class MamdaniPolicy:
         else:
             band: BandType = "CRITICAL"
 
-        # 5. Action Policy & Safety Enforcement (spec §8, §7.1.5)
-        action = "none"
-        cmd: dict | None = None
-
-        if band == "SAFE":
-            action = "none"
-            cmd = None
-        elif band == "WARN":
-            action = "beep_1"
-            cmd = {"cmd": "beep", "n": 1}
-        elif band == "ALARM":
-            action = "beep_3"
-            cmd = {"cmd": "beep", "n": 3}
-        elif band == "CRITICAL":
-            # Phân biệt rõ Alcohol vs Fatigue (spec §8):
-            # Khóa động cơ CHỈ KHI có cồn mức cao (ALCO >= 2)
-            if "alcohol" in drivers and (alco_val >= 0.30 or alco_lvl >= 2):
-                action = "lock"
-                cmd = {"cmd": "lock", "sig": "1"}
-            else:
-                action = "stop_driving"
-                cmd = {"cmd": "beep", "n": 5}
-
-        # 6. Quản lý Cooldown phát lệnh
-        should_send_cmd = False
-        if cmd is not None:
-            if band != self.last_band:
-                should_send_cmd = True
-            elif (now_s - self.last_action_ts) >= self.cooldown_s:
-                should_send_cmd = True
-
-        if should_send_cmd:
-            self.last_action_ts = now_s
-        else:
-            cmd = None
-
-        self.last_band = band
-        self.last_action = action
+        # 5. Áp dụng SafetyEnforcer (xác nhận cồn 2/3 lần đo & cooldown)
+        action, cmd = self.enforcer.decide_action(
+            band=band,
+            drivers=drivers,
+            alco_val=alco_val,
+            alco_lvl=alco_lvl,
+            now_s=now_s,
+        )
 
         return FusionResult(
             ts=now_ms,
@@ -425,4 +357,3 @@ class MamdaniPolicy:
             action=action,
             cmd_payload=cmd,
         )
-

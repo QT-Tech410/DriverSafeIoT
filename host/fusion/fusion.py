@@ -49,173 +49,23 @@ except AttributeError:  # pragma: no cover
     _CALLBACK_API = None
 
 
-@dataclass
-class VisionTelemetry:
-    """Cache bản tin metrics mới nhất từ Vision subsystem (spec §5)."""
+# Tách riêng module cache để tuân thủ kiến trúc chia nhỏ Single Responsibility
+from cache import (  # noqa: E402
+    Esp32Telemetry,
+    TelemetryCache,
+    TelemetryEvent,
+    VisionTelemetry,
+)
 
-    ts: float = 0.0
-    face: bool = False
-    ear: float = 0.0
-    perclos_60s: float = 0.0
-    cles_dur_ms: float = 0.0
-    mar: float = 0.0
-    yawn_per_min: float = 0.0
-    head_pitch_deg: float = 0.0
-    head_drop: bool = False
-    lux_mode: str = "day"
-    received_at: float = field(default_factory=time.time)
-
-    def as_dict(self) -> dict:
-        d = asdict(self)
-        d["received_at"] = round(self.received_at, 2)
-        return d
-
-
-@dataclass
-class Esp32Telemetry:
-    """Cache bản tin cảm biến mới nhất từ ESP32-S3 (spec §5)."""
-
-    ts: float = 0.0
-    mq3_ao_v: float = 0.0
-    rs_r0: float = 1.0
-    alcohol_g_l: float = 0.0
-    temp_c: float = 25.0
-    ldr_pct: int = 50
-    lux_mode: str = "day"
-    rssi: int = -60
-    uptime_s: int = 0
-    degraded: bool = False
-    received_at: float = field(default_factory=time.time)
-
-    def as_dict(self) -> dict:
-        d = asdict(self)
-        d["received_at"] = round(self.received_at, 2)
-        return d
-
-
-@dataclass
-class TelemetryEvent:
-    """Sự kiện tức thời ghi nhận từ Vision hoặc ESP32."""
-
-    source: str           # "vision" | "esp32"
-    name: str             # Tên sự kiện: microsleep, yawn, alcohol_level2,...
-    details: dict | str   # Dữ liệu bổ sung
-    ts: float = 0.0
-    received_at: float = field(default_factory=time.time)
-
-    def as_dict(self) -> dict:
-        return {
-            "source": self.source,
-            "name": self.name,
-            "details": self.details,
-            "ts": round(self.ts, 1),
-            "received_at": round(self.received_at, 2),
-        }
-
-
-class TelemetryCache:
-    """Bộ nhớ đệm lưu trữ dữ liệu telemetry và lịch sử sự kiện của Fusion."""
-
-    def __init__(
-        self,
-        max_events: int = 100,
-        history_len: int = 60,
-        vision_timeout_s: float | None = 2.0,
-        esp32_timeout_s: float | None = 5.0,
-    ) -> None:
-        self.vision_timeout_s = vision_timeout_s if vision_timeout_s is not None else 2.0
-        self.esp32_timeout_s = esp32_timeout_s if esp32_timeout_s is not None else 5.0
-
-        self.vision: VisionTelemetry | None = None
-        self.esp32: Esp32Telemetry | None = None
-        self.last_vision_ts: float = 0.0
-        self.last_esp32_ts: float = 0.0
-
-        self.events: deque[TelemetryEvent] = deque(maxlen=max_events)
-        self.history_vision: deque[VisionTelemetry] = deque(maxlen=history_len)
-        self.history_esp32: deque[Esp32Telemetry] = deque(maxlen=history_len)
-
-    def update_vision(self, payload: dict) -> VisionTelemetry:
-        """Cập nhật bản tin Vision metrics với xử lý an toàn (fallback default)."""
-        now = time.time()
-        try:
-            entry = VisionTelemetry(
-                ts=float(payload.get("ts", now * 1000)),
-                face=bool(payload.get("face", False)),
-                ear=float(payload.get("ear", 0.0)),
-                perclos_60s=float(payload.get("perclos_60s", 0.0)),
-                cles_dur_ms=float(payload.get("cles_dur_ms", 0.0)),
-                mar=float(payload.get("mar", 0.0)),
-                yawn_per_min=float(payload.get("yawn_per_min", 0.0)),
-                head_pitch_deg=float(payload.get("head_pitch_deg", 0.0)),
-                head_drop=bool(payload.get("head_drop", False)),
-                lux_mode=str(payload.get("lux_mode", "day")),
-                received_at=now,
-            )
-        except (ValueError, TypeError) as e:
-            print(f"[fusion.cache] Loi ep kieu VisionTelemetry: {e}. Dung default.", file=sys.stderr)
-            entry = VisionTelemetry(received_at=now)
-
-        self.vision = entry
-        self.last_vision_ts = now
-        self.history_vision.append(entry)
-        return entry
-
-    def update_esp32(self, payload: dict) -> Esp32Telemetry:
-        """Cập nhật bản tin ESP32 sensors với xử lý an toàn (fallback default)."""
-        now = time.time()
-        try:
-            entry = Esp32Telemetry(
-                ts=float(payload.get("ts", now * 1000)),
-                mq3_ao_v=float(payload.get("mq3_ao_v", 0.0)),
-                rs_r0=float(payload.get("rs_r0", 1.0)),
-                alcohol_g_l=float(payload.get("alcohol_g_l", 0.0)),
-                temp_c=float(payload.get("temp_c", 25.0)),
-                ldr_pct=int(payload.get("ldr_pct", 50)),
-                lux_mode=str(payload.get("lux_mode", "day")),
-                rssi=int(payload.get("rssi", -60)),
-                uptime_s=int(payload.get("uptime_s", 0)),
-                degraded=bool(payload.get("degraded", False)),
-                received_at=now,
-            )
-        except (ValueError, TypeError) as e:
-            print(f"[fusion.cache] Loi ep kieu Esp32Telemetry: {e}. Dung default.", file=sys.stderr)
-            entry = Esp32Telemetry(received_at=now)
-
-        self.esp32 = entry
-        self.last_esp32_ts = now
-        self.history_esp32.append(entry)
-        return entry
-
-    def add_event(self, source: str, name: str, details: dict | str, ts: float | None = None) -> TelemetryEvent:
-        """Ghi nhận một sự kiện vào hàng đợi sự kiện."""
-        now = time.time()
-        event_ts = ts if ts is not None else (now * 1000)
-        ev = TelemetryEvent(source=source, name=name, details=details, ts=event_ts, received_at=now)
-        self.events.append(ev)
-        return ev
-
-    def is_vision_online(self, timeout: float | None = None) -> bool:
-        """Kiểm tra nguồn Vision có đang hoạt động trong timeout không."""
-        t = timeout if timeout is not None else self.vision_timeout_s
-        return (time.time() - self.last_vision_ts) <= t if self.last_vision_ts > 0 else False
-
-    def is_esp32_online(self, timeout: float | None = None) -> bool:
-        """Kiểm tra node ESP32 có đang gửi dữ liệu trong timeout không."""
-        t = timeout if timeout is not None else self.esp32_timeout_s
-        return (time.time() - self.last_esp32_ts) <= t if self.last_esp32_ts > 0 else False
-
-    def get_snapshot(self) -> dict:
-        """Tổng hợp toàn bộ trạng thái hiện tại thành snapshot dictionary."""
-        return {
-            "ts": int(time.time() * 1000),
-            "vision_online": self.is_vision_online(),
-            "esp32_online": self.is_esp32_online(),
-            "vision": self.vision.as_dict() if self.vision else None,
-            "esp32": self.esp32.as_dict() if self.esp32 else None,
-            "events_count": len(self.events),
-            "latest_event": self.events[-1].as_dict() if self.events else None,
-        }
+# Re-export để tương thích ngược 100%
+__all__ = [
+    "Esp32Telemetry",
+    "TelemetryCache",
+    "TelemetryEvent",
+    "VisionTelemetry",
+    "FusionSubscriber",
+    "main",
+]
 
 
 class FusionSubscriber(mqtt.Client):
