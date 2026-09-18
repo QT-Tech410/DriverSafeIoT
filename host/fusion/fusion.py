@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import FusionConfig, load_config  # noqa: E402
 from policy import (  # noqa: E402
     FusionResult,
+    MamdaniPolicy,
     RuleWeightedPolicy,
     TOPIC_ESP32_CMD,
     TOPIC_EVENTS,
@@ -228,7 +229,7 @@ class FusionSubscriber(mqtt.Client):
         cache: TelemetryCache | None = None,
         vision_timeout_s: float | None = None,
         esp32_timeout_s: float | None = None,
-        policy: RuleWeightedPolicy | None = None,
+        policy: MamdaniPolicy | RuleWeightedPolicy | None = None,
     ) -> None:
         if _CALLBACK_API is not None:
             super().__init__(_CALLBACK_API, client_id=client_id)
@@ -241,7 +242,7 @@ class FusionSubscriber(mqtt.Client):
             vision_timeout_s=vision_timeout_s,
             esp32_timeout_s=esp32_timeout_s,
         )
-        self.policy = policy or RuleWeightedPolicy()
+        self.policy = policy or MamdaniPolicy()
         self.level_publish_count = 0
         self.cmd_publish_count = 0
         self.last_fusion_result: FusionResult | None = None
@@ -388,9 +389,10 @@ class FusionSubscriber(mqtt.Client):
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Fusion Telemetry Ingestion & Engine Node (FUS-01/02)")
+    parser = argparse.ArgumentParser(description="Fusion Telemetry Ingestion & Engine Node (FUS-01/02/03)")
     parser.add_argument("--host", default="127.0.0.1", help="Mosquitto broker host (override config)")
     parser.add_argument("--port", type=int, default=1883, help="Mosquitto broker port (override config)")
+    parser.add_argument("--policy", choices=["mamdani", "rule_weighted"], default="mamdani", help="Chon thuat toan Fusion (mac dinh: mamdani)")
     parser.add_argument("--config", default=None, help="Path to config.yaml (default: autodetect)")
     parser.add_argument("--duration", type=float, default=0.0, help="Thoi gian chay (0 = lien tuc)")
     args = parser.parse_args(argv)
@@ -404,6 +406,7 @@ def main(argv: list[str] | None = None) -> int:
         vision_timeout_s=cfg.vision_timeout_s,
         esp32_timeout_s=cfg.esp32_timeout_s,
     )
+    pol = MamdaniPolicy() if args.policy == "mamdani" else RuleWeightedPolicy()
     sub = FusionSubscriber(
         broker_host=broker_host,
         broker_port=broker_port,
@@ -411,13 +414,14 @@ def main(argv: list[str] | None = None) -> int:
         cache=cache,
         vision_timeout_s=cfg.vision_timeout_s,
         esp32_timeout_s=cfg.esp32_timeout_s,
+        policy=pol,
     )
 
     print(f"[fusion.engine] Dang ket noi Mosquitto broker tai {broker_host}:{broker_port}...")
     if not sub.connect_broker(timeout=3.0):
         print(f"[fusion.engine] CANH BAO: Chua ket noi duoc broker {broker_host}:{broker_port}", file=sys.stderr)
 
-    print("[fusion.engine] Da san sang thuc hien suy luan Fusion 1Hz. Nhan Ctrl+C de dung.\n")
+    print(f"[fusion.engine] Da san sang thuc hien suy luan Fusion ({args.policy.upper()}) 1Hz. Nhan Ctrl+C de dung.\n")
 
     t_start = time.perf_counter()
     try:

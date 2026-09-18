@@ -1,0 +1,214 @@
+# DriverSafe-IoT Mamdani Fuzzy Rules Configuration (§8 spec)
+# 6 Đầu vào (0-100): perclos, cles, yawn, head_drop, alco, cabin
+# 1 Đầu ra: risk (0-100) với 4 dải: safe, warn, alarm, critical
+
+inputs:
+  perclos:
+    range: [0, 100]
+    mfs:
+      low:
+        type: "trapmf"
+        params: [0, 0, 20, 40]
+      med:
+        type: "trimf"
+        params: [25, 45, 65]
+      high:
+        type: "trapmf"
+        params: [50, 70, 100, 100]
+
+  cles:
+    range: [0, 100]
+    mfs:
+      low:
+        type: "trapmf"
+        params: [0, 0, 20, 40]
+      med:
+        type: "trimf"
+        params: [25, 50, 75]
+      high:
+        type: "trapmf"
+        params: [60, 80, 100, 100]
+
+  yawn:
+    range: [0, 100]
+    mfs:
+      low:
+        type: "trapmf"
+        params: [0, 0, 15, 35]
+      med:
+        type: "trimf"
+        params: [25, 50, 75]
+      high:
+        type: "trapmf"
+        params: [60, 80, 100, 100]
+
+  head_drop:
+    range: [0, 100]
+    mfs:
+      low:
+        type: "trapmf"
+        params: [0, 0, 20, 50]
+      med:
+        type: "trimf"
+        params: [30, 50, 70]
+      high:
+        type: "trapmf"
+        params: [50, 80, 100, 100]
+
+  alco:
+    range: [0, 100]
+    mfs:
+      low:
+        type: "trapmf"
+        params: [0, 0, 15, 35]
+      med:
+        type: "trimf"
+        params: [25, 50, 75]
+      high:
+        type: "trapmf"
+        params: [65, 85, 100, 100]
+
+  cabin:
+    range: [0, 100]
+    mfs:
+      low:
+        type: "trapmf"
+        params: [0, 0, 20, 40]
+      med:
+        type: "trimf"
+        params: [25, 50, 75]
+      high:
+        type: "trapmf"
+        params: [60, 80, 100, 100]
+
+output:
+  risk:
+    range: [0, 100]
+    step: 0.5
+    mfs:
+      safe:
+        type: "trapmf"
+        params: [0, 0, 15, 30]
+      warn:
+        type: "trimf"
+        params: [20, 35, 50]
+      alarm:
+        type: "trimf"
+        params: [45, 60, 75]
+      critical:
+        type: "trapmf"
+        params: [70, 85, 100, 100]
+
+rules:
+  - id: "R1"
+    name: "perclos=CAO and alco>=TB -> RISK=CRITICAL"
+    antecedent:
+      op: "and"
+      conditions:
+        - { var: "perclos", mf: "high" }
+        - { var: "alco", mf: ["med", "high"] }
+    consequent: { var: "risk", mf: "critical" }
+
+  - id: "R2"
+    name: "perclos=CAO -> RISK=CRITICAL"
+    antecedent:
+      conditions:
+        - { var: "perclos", mf: "high" }
+    consequent: { var: "risk", mf: "critical" }
+
+  - id: "R3"
+    name: "cles=CAO (microsleep) or head_drop -> RISK=CRITICAL"
+    antecedent:
+      op: "or"
+      conditions:
+        - { var: "cles", mf: "high" }
+        - { var: "head_drop", mf: "high" }
+    consequent: { var: "risk", mf: "critical" }
+
+  - id: "R4"
+    name: "perclos=TB and cles=TB -> RISK=ALARM"
+    antecedent:
+      op: "and"
+      conditions:
+        - { var: "perclos", mf: "med" }
+        - { var: "cles", mf: "med" }
+    consequent: { var: "risk", mf: "alarm" }
+
+  - id: "R5"
+    name: "yawn=CAO and perclos>=TB -> RISK=ALARM"
+    antecedent:
+      op: "and"
+      conditions:
+        - { var: "yawn", mf: "high" }
+        - { var: "perclos", mf: ["med", "high"] }
+    consequent: { var: "risk", mf: "alarm" }
+
+  - id: "R6"
+    name: "perclos=TB and cabin=CAO -> RISK=ALARM"
+    antecedent:
+      op: "and"
+      conditions:
+        - { var: "perclos", mf: "med" }
+        - { var: "cabin", mf: "high" }
+    consequent: { var: "risk", mf: "alarm" }
+
+  - id: "R7"
+    name: "alco=CAO and perclos>=TB -> RISK=CRITICAL"
+    antecedent:
+      op: "and"
+      conditions:
+        - { var: "alco", mf: "high" }
+        - { var: "perclos", mf: ["med", "high"] }
+    consequent: { var: "risk", mf: "critical" }
+
+  - id: "R8"
+    name: "alco=CAO and perclos=THAP -> RISK=ALARM"
+    antecedent:
+      op: "and"
+      conditions:
+        - { var: "alco", mf: "high" }
+        - { var: "perclos", mf: "low" }
+    consequent: { var: "risk", mf: "alarm" }
+
+  - id: "R9"
+    name: "yawn=TB and cabin=CAO -> RISK=WARN"
+    antecedent:
+      op: "and"
+      conditions:
+        - { var: "yawn", mf: "med" }
+        - { var: "cabin", mf: "high" }
+        - { var: "perclos", mf: "low" }
+        - { var: "alco", mf: "low" }
+    consequent: { var: "risk", mf: "warn" }
+
+  - id: "R10"
+    name: "perclos=TB don thuan -> RISK=WARN"
+    antecedent:
+      op: "and"
+      conditions:
+        - { var: "perclos", mf: "med" }
+        - { var: "cles", mf: "low" }
+    consequent: { var: "risk", mf: "warn" }
+
+  - id: "R11"
+    name: "cabin=CAO don thuan -> RISK=WARN"
+    antecedent:
+      op: "and"
+      conditions:
+        - { var: "cabin", mf: "high" }
+        - { var: "perclos", mf: "low" }
+        - { var: "alco", mf: "low" }
+    consequent: { var: "risk", mf: "warn" }
+
+  - id: "R12"
+    name: "tat ca thap -> RISK=SAFE"
+    antecedent:
+      op: "and"
+      conditions:
+        - { var: "perclos", mf: "low" }
+        - { var: "cles", mf: "low" }
+        - { var: "yawn", mf: "low" }
+        - { var: "head_drop", mf: "low" }
+        - { var: "alco", mf: "low" }
+        - { var: "cabin", mf: "low" }
+    consequent: { var: "risk", mf: "safe" }

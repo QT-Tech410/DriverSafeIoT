@@ -273,3 +273,156 @@ class RuleWeightedPolicy:
             action=action,
             cmd_payload=cmd,
         )
+
+
+class MamdaniPolicy:
+    """Bộ suy luận Fusion ứng dụng Fuzzy Mamdani Engine (§8 spec, FUS-03)."""
+
+    def __init__(
+        self,
+        rules_path: str | Path | None = None,
+        cooldown_s: float = 10.0,
+    ) -> None:
+        from fuzzy import MamdaniEngine, normalize_inputs
+
+        self.engine = MamdaniEngine(rules_path)
+        self.normalize_inputs = normalize_inputs
+        self.cooldown_s = cooldown_s
+
+        self.last_action_ts: float = 0.0
+        self.last_band: BandType = "SAFE"
+        self.last_action: str = "none"
+
+    def evaluate(
+        self,
+        vision_data: dict | None,
+        esp32_data: dict | None,
+        vision_online: bool = True,
+        esp32_online: bool = True,
+        current_time_ms: int | float | None = None,
+    ) -> FusionResult:
+        """Thực hiện suy luận Risk Score bằng Mamdani Fuzzy Engine và áp dụng Action Policy."""
+        now_ms = current_time_ms if current_time_ms is not None else int(time.time() * 1000)
+        now_s = time.time()
+
+        v_dict = vision_data or {}
+        e_dict = esp32_data or {}
+
+        # 1. Trích xuất chỉ số
+        perclos_val = float(v_dict.get("perclos_60s", 0.0)) if vision_online else 0.0
+        cles_val = float(v_dict.get("cles_dur_ms", 0.0)) if vision_online else 0.0
+        head_drop_val = bool(v_dict.get("head_drop", False)) if vision_online else False
+        yawn_val = float(v_dict.get("yawn_per_min", 0.0)) if vision_online else 0.0
+
+        alco_val = float(e_dict.get("alcohol_g_l", 0.0))
+        alco_lvl = int(e_dict.get("alco_level", 2 if alco_val >= 0.3 else (1 if alco_val >= 0.1 else 0)))
+        temp_val = float(e_dict.get("temp_c", 25.0))
+        lux_val = str(e_dict.get("lux_mode", "day"))
+        ldr_pct = int(e_dict.get("ldr_pct", 50))
+        ldr_lux = 20.0 if lux_val in ("dark", "night") or ldr_pct <= 20 else 300.0
+
+        # 2. Chuẩn hóa thang 0 - 100 cho 6 inputs
+        fuzzy_inputs = self.normalize_inputs(
+            perclos_pct=perclos_val,
+            cles_dur_ms=cles_val,
+            yawn_per_min=yawn_val,
+            head_drop=head_drop_val,
+            alco_level=alco_lvl,
+            ntc_temp_c=temp_val,
+            ldr_lux=ldr_lux,
+        )
+
+        drivers: list[str] = []
+
+        # 3. Suy luận Mamdani
+        if vision_online:
+            risk, fired_rules = self.engine.infer(fuzzy_inputs)
+
+            # Phân loại drivers từ các luật fired
+            fired_ids = {r.id for r in fired_rules if r.weight >= 0.1}
+            if alco_val >= 0.10 or alco_lvl >= 1 or any(r in fired_ids for r in ("R1", "R7", "R8")):
+                drivers.append("alcohol")
+            if any(r in fired_ids for r in ("R1", "R2", "R4", "R5", "R6", "R7", "R10")):
+                drivers.append("perclos")
+            if any(r in fired_ids for r in ("R3", "R4", "R5")):
+                drivers.append("fatigue")
+            if any(r in fired_ids for r in ("R6", "R9", "R11")):
+                drivers.append("cabin")
+        else:
+            # Fallback khi mất Vision > 2s: suy luận thuần cảm biến
+            s_alco = fuzzy_inputs["alco"]
+            s_cabin = fuzzy_inputs["cabin"]
+            risk = round(0.75 * s_alco + 0.25 * s_cabin, 1)
+            drivers.append("vision_offline")
+            if s_alco >= 40.0:
+                drivers.append("alcohol")
+            if s_cabin >= 40.0:
+                drivers.append("cabin")
+
+        # Cồn mức 2 (ALCO=2, >=0.3 g/L) luôn kích hoạt rủi ro khẩn cấp CRITICAL
+        if alco_val >= 0.30 or alco_lvl >= 2:
+            risk = max(risk, 85.0)
+            if "alcohol" not in drivers:
+                drivers.append("alcohol")
+
+        if not drivers:
+            drivers.append("normal")
+
+        # 4. Phân dải Risk thành 4 band chính xác
+        if risk < 25.0:
+            band: BandType = "SAFE"
+        elif risk < 50.0:
+            band: BandType = "WARN"
+        elif risk <= 75.0:
+            band: BandType = "ALARM"
+        else:
+            band: BandType = "CRITICAL"
+
+        # 5. Action Policy & Safety Enforcement (spec §8, §7.1.5)
+        action = "none"
+        cmd: dict | None = None
+
+        if band == "SAFE":
+            action = "none"
+            cmd = None
+        elif band == "WARN":
+            action = "beep_1"
+            cmd = {"cmd": "beep", "n": 1}
+        elif band == "ALARM":
+            action = "beep_3"
+            cmd = {"cmd": "beep", "n": 3}
+        elif band == "CRITICAL":
+            # Phân biệt rõ Alcohol vs Fatigue (spec §8):
+            # Khóa động cơ CHỈ KHI có cồn mức cao (ALCO >= 2)
+            if "alcohol" in drivers and (alco_val >= 0.30 or alco_lvl >= 2):
+                action = "lock"
+                cmd = {"cmd": "lock", "sig": "1"}
+            else:
+                action = "stop_driving"
+                cmd = {"cmd": "beep", "n": 5}
+
+        # 6. Quản lý Cooldown phát lệnh
+        should_send_cmd = False
+        if cmd is not None:
+            if band != self.last_band:
+                should_send_cmd = True
+            elif (now_s - self.last_action_ts) >= self.cooldown_s:
+                should_send_cmd = True
+
+        if should_send_cmd:
+            self.last_action_ts = now_s
+        else:
+            cmd = None
+
+        self.last_band = band
+        self.last_action = action
+
+        return FusionResult(
+            ts=now_ms,
+            risk=risk,
+            band=band,
+            drivers=drivers,
+            action=action,
+            cmd_payload=cmd,
+        )
+
