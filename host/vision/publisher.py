@@ -10,6 +10,7 @@ lên `ds/vision/events` với QoS 1 (spec §6.1).
 Chạy:
     python host/vision/publisher.py                     # webcam + mở cửa sổ camera trực quan
     python host/vision/publisher.py --headless          # chạy ngầm không mở GUI
+    python host/vision/publisher.py --config config.yaml
     python host/vision/publisher.py --host 127.0.0.1 --port 1883
 """
 
@@ -17,9 +18,9 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import sys
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -42,8 +43,14 @@ from temporal import (  # noqa: E402
     TemporalMetrics,
     draw_temporal_hud,
 )
+from config import (  # noqa: E402
+    Esp32Config,
+    VisionConfig,
+    VisionTelemetryConfig,
+    load_config,
+)
 
-# MQTT Topics theo đặc tả spec §5
+# Backward compatibility exports cho các script test / external callers
 TOPIC_VISION_METRICS = "ds/vision/metrics"
 TOPIC_VISION_EVENTS = "ds/vision/events"
 TOPIC_ESP32_SENSORS = "ds/esp32/sensors"
@@ -65,19 +72,29 @@ class VisionPublisher(mqtt.Client):
         broker_port: int = 1883,
         client_id: str = "vision_publisher",
         keepalive: int = 60,
+        config: VisionConfig | None = None,
     ) -> None:
         if _CALLBACK_API is not None:
             super().__init__(_CALLBACK_API, client_id=client_id)
         else:  # pragma: no cover
             super().__init__(client_id=client_id)
 
-        self.broker_host = broker_host
-        self.broker_port = broker_port
-        self.keepalive = keepalive
+        self.config = config or load_config()
+        self.mqtt_config = self.config.mqtt
+
+        # Ưu tiên giá trị truyền trực tiếp vào constructor nếu khác default, ngược lại lấy từ config
+        self.broker_host = broker_host if broker_host != "127.0.0.1" else self.mqtt_config.broker_host
+        self.broker_port = broker_port if broker_port != 1883 else self.mqtt_config.broker_port
+        self.keepalive = keepalive if keepalive != 60 else self.mqtt_config.keepalive
         self.publish_count = 0
         self.event_publish_count = 0
         self.last_published_ts: float = 0.0
         self.current_lux_mode: str = "day"
+
+        # Topics từ config (liquid, spec-compliant)
+        self.topic_telemetry = self.config.telemetry.topic
+        self.topic_events = self.config.events.topic
+        self.topic_sensors = self.config.esp32.topic_sensors
 
         self.on_connect = self._handle_connect
         self.on_disconnect = self._handle_disconnect
@@ -91,8 +108,8 @@ class VisionPublisher(mqtt.Client):
         is_ok = (reason_code == 0) if isinstance(reason_code, int) else (not reason_code.is_failure)
         if is_ok:
             print(f"[publisher] Da ket noi Mosquitto broker tai {self.broker_host}:{self.broker_port}")
-            # Đăng ký nhận lux_mode từ ESP32 sensor nếu có (spec §6.4)
-            self.subscribe(TOPIC_ESP32_SENSORS, qos=0)
+            # Đăng ký nhận lux_mode từ ESP32 sensor (spec §6.4)
+            self.subscribe(self.topic_sensors, qos=self.config.esp32.qos_sensors)
         else:
             print(f"[publisher] Ket noi broker that bai: code {reason_code}", file=sys.stderr)
 
@@ -100,7 +117,7 @@ class VisionPublisher(mqtt.Client):
         print(f"[publisher] Da ngat ket noi khoi Mosquitto broker (code {reason_code})")
 
     def _handle_message(self, client, userdata, msg) -> None:
-        if msg.topic == TOPIC_ESP32_SENSORS:
+        if msg.topic == self.topic_sensors:
             try:
                 data = json.loads(msg.payload.decode("utf-8"))
                 lux = data.get("lux_mode")
@@ -146,16 +163,26 @@ class VisionPublisher(mqtt.Client):
         payload_dict["lux_mode"] = self.current_lux_mode
         payload_str = json.dumps(payload_dict)
 
-        info = self.publish(TOPIC_VISION_METRICS, payload_str, qos=0)
+        info = self.publish(
+            self.topic_telemetry,
+            payload_str,
+            qos=self.config.telemetry.qos,
+        )
         self.publish_count += 1
         self.last_published_ts = time.time()
         return info.rc == mqtt.MQTT_ERR_SUCCESS
 
     def publish_event(self, ev: Event) -> bool:
-        """Publish sự kiện tức thời lên ds/vision/events (QoS 1)."""
+        """Publish sự kiện tức thời lên ds/vision/events (QoS 1).
+
+        LƯU Ý KIẾN TRÚC (extension over spec §5):
+          - Spec §5 KHÔNG có ds/vision/events
+          - Vision subsystem quản lý event lifecycle độc lập → topic riêng
+          - Fusion có thể opcional subscribe (được implement trong FUS-01)
+        """
         payload_dict = ev.as_dict()
         payload_str = json.dumps(payload_dict)
-        info = self.publish(TOPIC_VISION_EVENTS, payload_str, qos=1)
+        info = self.publish(self.topic_events, payload_str, qos=self.config.events.qos)
         self.event_publish_count += 1
         return info.rc == mqtt.MQTT_ERR_SUCCESS
 
@@ -187,6 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="DriverSafe-IoT Vision Metrics MQTT Publisher (VIS-05)")
     p.add_argument("--host", default="127.0.0.1", help="Dia chi Mosquitto Broker (mac dinh: 127.0.0.1)")
     p.add_argument("--port", type=int, default=1883, help="Port MQTT Broker (mac dinh: 1883)")
+    p.add_argument("--config", default=None, help="Duong dan den config.yaml (mac dinh: config.yaml o root repo)")
     p.add_argument("--src", choices=["webcam", "mjpeg"], default="webcam")
     p.add_argument("--index", type=int, default=0, help="Camera index")
     p.add_argument("--url", default=None, help="MJPEG stream URL")
@@ -201,12 +229,21 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    # 1. Khởi tạo MQTT Publisher
-    pub = VisionPublisher(broker_host=args.host, broker_port=args.port)
-    print(f"[publisher] Dang ket noi toi broker {args.host}:{args.port}...")
+    # 1. Nạp cấu hình (config.yaml > defaults). CLI args override host/port.
+    cfg = load_config(args.config)
+    broker_host = args.host if args.host != "127.0.0.1" else cfg.mqtt.broker_host
+    broker_port = args.port if args.port != 1883 else cfg.mqtt.broker_port
+
+    # Khởi tạo MQTT Publisher
+    pub = VisionPublisher(
+        broker_host=broker_host,
+        broker_port=broker_port,
+        config=cfg,
+    )
+    print(f"[publisher] Dang ket noi toi broker {broker_host}:{broker_port}...")
     connected = pub.connect_broker(timeout=3.0)
     if not connected:
-        print(f"[publisher] CANH BAO: Chua ket noi duoc broker {args.host}:{args.port}. "
+        print(f"[publisher] CANH BAO: Chua ket noi duoc broker {broker_host}:{broker_port}. "
               "Hay chac chan mosquitto dang chay! (tiep tuc thu ket noi lai)", file=sys.stderr)
 
     # 2. Khởi tạo Face Mesh

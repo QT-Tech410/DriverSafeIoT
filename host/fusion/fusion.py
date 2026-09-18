@@ -24,15 +24,15 @@ from typing import Callable
 
 import paho.mqtt.client as mqtt
 
-# Topic MQTT theo chuẩn spec §5
+# Cho phép import các module cùng cấp trong thư mục host/fusion
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config import FusionConfig, load_config  # noqa: E402
+
+# Topic MQTT theo chuẩn spec §5 / spec §6.1
 TOPIC_ESP32_SENSORS = "ds/esp32/sensors"
 TOPIC_ESP32_EVENTS = "ds/esp32/events"
 TOPIC_VISION_METRICS = "ds/vision/metrics"
 TOPIC_VISION_EVENTS = "ds/vision/events"
-
-# Ngưỡng timeout mất kết nối (spec §8, §3)
-VISION_TIMEOUT_S = 2.0   # Mất vision > 2s -> fallback sang nhánh cảm biến
-ESP32_TIMEOUT_S = 5.0    # Mất ESP32 > 5s -> ESP32 chuyển sang degraded mode tự chủ
 
 # Tương thích Paho MQTT v1 và v2
 try:
@@ -108,7 +108,16 @@ class TelemetryEvent:
 class TelemetryCache:
     """Bộ nhớ đệm lưu trữ dữ liệu telemetry và lịch sử sự kiện của Fusion."""
 
-    def __init__(self, max_events: int = 100, history_len: int = 60) -> None:
+    def __init__(
+        self,
+        max_events: int = 100,
+        history_len: int = 60,
+        vision_timeout_s: float | None = 2.0,
+        esp32_timeout_s: float | None = 5.0,
+    ) -> None:
+        self.vision_timeout_s = vision_timeout_s if vision_timeout_s is not None else 2.0
+        self.esp32_timeout_s = esp32_timeout_s if esp32_timeout_s is not None else 5.0
+
         self.vision: VisionTelemetry | None = None
         self.esp32: Esp32Telemetry | None = None
         self.last_vision_ts: float = 0.0
@@ -178,13 +187,15 @@ class TelemetryCache:
         self.events.append(ev)
         return ev
 
-    def is_vision_online(self, timeout: float = VISION_TIMEOUT_S) -> bool:
-        """Kiểm tra nguồn Vision có đang hoạt động trong timeout (2s) không."""
-        return (time.time() - self.last_vision_ts) <= timeout if self.last_vision_ts > 0 else False
+    def is_vision_online(self, timeout: float | None = None) -> bool:
+        """Kiểm tra nguồn Vision có đang hoạt động trong timeout không."""
+        t = timeout if timeout is not None else self.vision_timeout_s
+        return (time.time() - self.last_vision_ts) <= t if self.last_vision_ts > 0 else False
 
-    def is_esp32_online(self, timeout: float = ESP32_TIMEOUT_S) -> bool:
-        """Kiểm tra node ESP32 có đang gửi dữ liệu trong timeout (5s) không."""
-        return (time.time() - self.last_esp32_ts) <= timeout if self.last_esp32_ts > 0 else False
+    def is_esp32_online(self, timeout: float | None = None) -> bool:
+        """Kiểm tra node ESP32 có đang gửi dữ liệu trong timeout không."""
+        t = timeout if timeout is not None else self.esp32_timeout_s
+        return (time.time() - self.last_esp32_ts) <= t if self.last_esp32_ts > 0 else False
 
     def get_snapshot(self) -> dict:
         """Tổng hợp toàn bộ trạng thái hiện tại thành snapshot dictionary."""
@@ -208,6 +219,8 @@ class FusionSubscriber(mqtt.Client):
         broker_port: int = 1883,
         client_id: str = "fusion_subscriber",
         cache: TelemetryCache | None = None,
+        vision_timeout_s: float | None = None,
+        esp32_timeout_s: float | None = None,
     ) -> None:
         if _CALLBACK_API is not None:
             super().__init__(_CALLBACK_API, client_id=client_id)
@@ -216,7 +229,10 @@ class FusionSubscriber(mqtt.Client):
 
         self.broker_host = broker_host
         self.broker_port = broker_port
-        self.cache = cache or TelemetryCache()
+        self.cache = cache or TelemetryCache(
+            vision_timeout_s=vision_timeout_s,
+            esp32_timeout_s=esp32_timeout_s,
+        )
 
         # Hooks cho module Fusion Engine (FUS-02 / FUS-03)
         self.on_vision_update: Callable[[VisionTelemetry], None] | None = None
@@ -318,17 +334,33 @@ class FusionSubscriber(mqtt.Client):
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Fusion Telemetry Ingestion Node (FUS-01)")
-    parser.add_argument("--host", default="127.0.0.1", help="Mosquitto broker host")
-    parser.add_argument("--port", type=int, default=1883, help="Mosquitto broker port")
+    parser.add_argument("--host", default="127.0.0.1", help="Mosquitto broker host (override config)")
+    parser.add_argument("--port", type=int, default=1883, help="Mosquitto broker port (override config)")
+    parser.add_argument("--config", default=None, help="Path to config.yaml (default: autodetect)")
     parser.add_argument("--duration", type=float, default=0.0, help="Thoi gian chay (0 = lien tuc)")
     args = parser.parse_args(argv)
 
-    cache = TelemetryCache()
-    sub = FusionSubscriber(broker_host=args.host, broker_port=args.port, cache=cache)
+    # 1. Nạp cấu hình (config.yaml > defaults). CLI args override host/port.
+    cfg: FusionConfig = load_config(args.config)
+    broker_host = args.host if args.host != "127.0.0.1" else cfg.broker_host
+    broker_port = args.port if args.port != 1883 else cfg.broker_port
 
-    print(f"[fusion.ingestion] Dang ket noi Mosquitto broker tai {args.host}:{args.port}...")
+    cache = TelemetryCache(
+        vision_timeout_s=cfg.vision_timeout_s,
+        esp32_timeout_s=cfg.esp32_timeout_s,
+    )
+    sub = FusionSubscriber(
+        broker_host=broker_host,
+        broker_port=broker_port,
+        client_id=cfg.client_id,
+        cache=cache,
+        vision_timeout_s=cfg.vision_timeout_s,
+        esp32_timeout_s=cfg.esp32_timeout_s,
+    )
+
+    print(f"[fusion.ingestion] Dang ket noi Mosquitto broker tai {broker_host}:{broker_port}...")
     if not sub.connect_broker(timeout=3.0):
-        print(f"[fusion.ingestion] CANH BAO: Chua ket noi duoc broker {args.host}:{args.port}", file=sys.stderr)
+        print(f"[fusion.ingestion] CANH BAO: Chua ket noi duoc broker {broker_host}:{broker_port}", file=sys.stderr)
 
     print("[fusion.ingestion] Da san sang lang nghe 3 luong du lieu. Nhan Ctrl+C de dung.\n")
 

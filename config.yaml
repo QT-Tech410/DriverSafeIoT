@@ -1,0 +1,44 @@
+# DriverSafe-IoT configuration file (config.yaml)
+# Defines MQTT + Vision + Temporal + Fusion thresholds
+
+mqtt:
+  broker_host: 127.0.0.1
+  broker_port: 1883
+  client_id: vision_publisher
+  keepalive: 60
+
+vision:
+  # Schema cho ds/vision/metrics (spec §5)
+  telemetry:
+    topic: ds/vision/metrics
+    qos: 0
+  # ds/vision/events là extension theo spec §6.1 (vision subsystem quản lý event lifecycle độc lập)
+  events:
+    topic: ds/vision/events
+    qos: 1
+
+esp32:
+  # Topic để nhận lux_mode từ ESP32 sensor (spec §6.4)
+  topic_sensors: ds/esp32/sensors
+  topic_events: ds/esp32/events
+  qos_sensors: 0
+  qos_events: 1
+
+temporal:
+  buffer_seconds: 60
+  sample_freq_hz: 10
+  # Ngưỡng event theo spec §6.2
+  T_CLOSED_SEC: 0.20      # Eye closure ≥ 200ms
+  MICROSLEEP_MS: 500      # Eye closure ≥ 500ms = microsleep
+  EYE_CLOSURE_MS: 250     # Eye closure ≥ 250ms = eye_closure event
+  HEAD_DROP_MS: 800       # Head drop ≥ 800ms = event
+  YAWN_MS: 400            # Yawn ≥ 400ms = event
+  HEAD_DROP_DEG: 15.0     # >15° từ neutral = head_drop
+  FACE_LOST_MS: 2000      # Không thấy face ≥ 2000ms = face_lost
+
+fusion:
+  # Timeout độ tươi dữ liệu (spec §8, §3)
+  vision_timeout_s: 2.0    # Mất vision > 2s -> fallback sang nhánh cảm biến
+  esp32_timeout_s: 5.0     # Mất ESP32 > 5s -> degraded mode tự chủ
+
+models_dir: host/vision/models
