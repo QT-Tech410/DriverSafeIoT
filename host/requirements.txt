@@ -8,3 +8,5 @@ uvicorn>=0.22.0
 scikit-fuzzy>=0.4.2
 pyyaml>=6.0
 matplotlib>=3.7.0
+httpx>=0.25.0
+websockets>=12.0
