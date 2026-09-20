@@ -306,6 +306,14 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"\n[publisher EVENT] >>> EYE_CLOSURE KET THUC <<< | Mo mat sau: {ev.duration_ms:.0f}ms")
                 elif ev.kind == "yawn_end":
                     print(f"\n[publisher EVENT] >>> YAWN HOAN TAT <<< | Khep mieng sau: {ev.duration_ms:.0f}ms")
+                elif ev.kind == "head_drop_fatigue":
+                    print(f"\n[publisher EVENT] >>> NGUY HIEM: GUC DAU NGU GAT (FATIGUE) <<< | {ev.duration_ms:.0f}ms")
+                elif ev.kind == "head_drop_distraction":
+                    print(f"\n[publisher EVENT] >>> CANH BAO: MAT TAP TRUNG NHIN MAN HINH (DISTRACTION) <<< | {ev.duration_ms:.0f}ms")
+                elif ev.kind in ("head_drop_fatigue_end", "head_drop_distraction_end"):
+                    print(f"\n[publisher EVENT] >>> DA NGANG DAU LEN <<< | Thoi gian cui: {ev.duration_ms:.0f}ms")
+                elif ev.kind == "head_drop":
+                    pass  # Da co log chi tiet theo fatigue/distraction
                 else:
                     print(f"[publisher EVENT] {ev.kind.upper():<12} | bat dau: {ev.t_ms:.0f}ms | do dai: {ev.duration_ms:.0f}ms")
 

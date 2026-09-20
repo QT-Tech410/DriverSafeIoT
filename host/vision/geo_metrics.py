@@ -136,11 +136,21 @@ def compute_pitch(pts: np.ndarray, image_size: tuple[int, int],
     if not ok:
         return 0.0, False
 
-    # Chuyển rotation vector -> rotation matrix -> Euler pitch (trục X).
+    # Chuyển rotation vector -> rotation matrix (3x3).
     rmat, _ = cv2.Rodrigues(_rvec)
+
+    # Phân rã ma trận quay trực giao triệt tiêu nhiễu chéo (Cross-talk / Gimbal Lock)
+    # Tính định thức hình chiếu sy = sqrt(R[0,0]^2 + R[1,0]^2) để tách biệt góc Yaw khỏi Pitch
+    sy = np.sqrt(rmat[0, 0] * rmat[0, 0] + rmat[1, 0] * rmat[1, 0])
+    singular = sy < 1e-6
+
+    if not singular:
+        pitch = np.arctan2(rmat[2, 1], rmat[2, 2])
+    else:
+        pitch = np.arctan2(-rmat[1, 2], rmat[1, 1])
+
     # Đã kiểm chứng thực nghiệm (VIS-03): nhìn thẳng ≈ 0, cúi đầu → âm,
     # ngẩng đầu → dương. Khớp quy ước "pitch dương = ngửa đầu lên".
-    pitch = np.arctan2(rmat[2, 1], rmat[2, 2])
     return float(np.degrees(pitch)), True
 
 

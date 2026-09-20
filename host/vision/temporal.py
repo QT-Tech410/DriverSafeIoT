@@ -35,7 +35,9 @@ MICROSLEEP_MS = 1200.0               # >= 1200ms (1.2s - chu kỳ sinh học gi�
 YAWN_MS = 400.0                      # MAR >= T_yawn >= 400ms (1 chu kỳ mở->khép)
 YAWN_CLOSE_DEBOUNCE = 2              # 2 mẫu (~200ms tại 10Hz) khử nhiễu khép miệng (Release Debounce)
 YAWN_FACE_LOST_TOLERANCE_MS = 1500.0 # Dung thứ mất mặt khi ngáp (che tay / ngửa cổ) tối đa 1.5s
-HEAD_DROP_MS = 800.0                 # |pitch - neutral| >= 15° >= 0.8s
+HEAD_DROP_FATIGUE_MS = 800.0         # Mắt nhắm: >= 800ms kích hoạt báo động ngủ gật / gục đầu (Fatigue)
+HEAD_DROP_DISTRACTION_MS = 2500.0    # Mắt mở: >= 2500ms kích hoạt cảnh báo mất tập trung nhìn màn hình (Distraction)
+HEAD_DROP_MS = HEAD_DROP_FATIGUE_MS  # Giữ alias tương thích ngược
 FACE_LOST_MS = 2000.0                # không thấy mặt >= 2s
 
 # --- Ngưỡng hình học mặc định ---
@@ -165,9 +167,11 @@ class TemporalMetrics:
         self._yawn_events: deque[float] = deque(maxlen=1200)
         self._yawn_count_window: deque[float] = deque(maxlen=600)
 
-        # --- Head drop ---
+        # --- Head drop (Dynamic Threshold: Fatigue vs Distraction) ---
         self._hd_start: float | None = None
         self._hd_fired = False
+        self._hd_type: str | None = None          # "head_drop_fatigue" | "head_drop_distraction"
+        self.last_hd_dur_ms: float = 0.0
 
         # --- Face lost ---
         self._face_last_seen: float = 0.0
@@ -421,17 +425,61 @@ class TemporalMetrics:
                         self._yawn_close_run = 0
                         self._yawn_lost_start = None
 
-        # --- Head drop: pitch <= neutral - 15°, >= 0.8s (Bảo toàn 100%) ---
+        # --- Head drop: Ngưỡng động phối hợp trạng thái Mắt (Fatigue vs Distraction) ---
         hd_now = self._last_face and (self._last_pitch <= self.pitch_neutral - HEAD_DROP_DEG)
         if not hd_now:
+            if self._hd_fired and self._hd_type is not None:
+                final_dur = t_ms - self._hd_start if self._hd_start is not None else 0.0
+                updated = self._update_event_duration(self._hd_type, self._hd_start, final_dur)
+                if not updated:
+                    self._events.append(Event(f"{self._hd_type}_end", self._hd_start, final_dur))
+                self._update_event_duration("head_drop", self._hd_start, final_dur)
+                self.last_hd_dur_ms = final_dur
+
             self._hd_start = None
             self._hd_fired = False
-        elif self._hd_start is None:
-            self._hd_start = t_ms
-            self._hd_fired = False
-        elif not self._hd_fired and t_ms - self._hd_start >= HEAD_DROP_MS:
-            self._hd_fired = True
-            self._events.append(Event("head_drop", self._hd_start, t_ms - self._hd_start))
+            self._hd_type = None
+        else:
+            if self._hd_start is None:
+                self._hd_start = t_ms
+                self._hd_fired = False
+                self._hd_type = None
+
+            dur = t_ms - self._hd_start
+
+            # Phân nhánh theo trạng thái mắt (self._closed_state):
+            if self._closed_state:
+                # 1. Nhánh Ngủ gật / Gục đầu (Fatigue) - Ngưỡng nghiêm ngặt 800ms
+                if not self._hd_fired:
+                    if dur >= HEAD_DROP_FATIGUE_MS:
+                        self._hd_fired = True
+                        self._hd_type = "head_drop_fatigue"
+                        self._events.append(Event("head_drop_fatigue", self._hd_start, dur))
+                        self._events.append(Event("head_drop", self._hd_start, dur))
+                else:
+                    # Nếu trước đó đang cảnh báo distraction mà tài xế ngủ thiếp đi (khép mắt) -> Nâng cấp thành fatigue!
+                    if self._hd_type == "head_drop_distraction":
+                        self._retract_event("head_drop_distraction", self._hd_start)
+                        self._hd_type = "head_drop_fatigue"
+                        self._events.append(Event("head_drop_fatigue", self._hd_start, dur))
+                    elif self._hd_type == "head_drop_fatigue":
+                        self._update_event_duration("head_drop_fatigue", self._hd_start, dur)
+                        self._update_event_duration("head_drop", self._hd_start, dur)
+            else:
+                # 2. Nhánh Mất tập trung / Cúi nhìn màn hình (Distraction) - Ngưỡng an toàn 2500ms
+                if not self._hd_fired:
+                    if dur >= HEAD_DROP_DISTRACTION_MS:
+                        self._hd_fired = True
+                        self._hd_type = "head_drop_distraction"
+                        self._events.append(Event("head_drop_distraction", self._hd_start, dur))
+                        self._events.append(Event("head_drop", self._hd_start, dur))
+                else:
+                    if self._hd_type == "head_drop_distraction":
+                        self._update_event_duration("head_drop_distraction", self._hd_start, dur)
+                        self._update_event_duration("head_drop", self._hd_start, dur)
+                    elif self._hd_type == "head_drop_fatigue":
+                        self._update_event_duration("head_drop_fatigue", self._hd_start, dur)
+                        self._update_event_duration("head_drop", self._hd_start, dur)
 
         # --- Face lost: không thấy mặt >= 2s (Bảo toàn 100%) ---
         if self._last_face:
