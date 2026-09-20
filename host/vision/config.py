@@ -81,8 +81,8 @@ class TemporalConfig:
     sample_freq_hz: int = 10
 
     # Ngưỡng event (giây = ms / 1000)
-    T_CLOSED_SEC: float = 0.20  # Eye closure ≥ 200ms
-    MICROSLEEP_MS: int = 500  # ≥ 500ms eye closure equals microsleep
+    T_CLOSED_SEC: float = 0.22  # Eye closure (chuẩn hóa người châu Á / mắt mí lót)
+    MICROSLEEP_MS: int = 1200  # ≥ 1200ms eye closure equals microsleep (1.2s giấc ngủ trắng)
     EYE_CLOSURE_MS: int = 250  # ≥ 250ms eye closure is an event
     HEAD_DROP_MS: int = 800  # Miễn tối thiếu 800ms
 

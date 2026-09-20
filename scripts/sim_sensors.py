@@ -285,6 +285,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=1883, help="Broker port (1883)")
     parser.add_argument("--duration", type=float, default=0.0, help="Thoi gian chay tu dong (0 = chay lien tuc)")
     parser.add_argument("--level", type=int, default=0, choices=[0, 1, 2], help="Khoi tao muc con ban dau (0, 1, 2)")
+    parser.add_argument("--interactive", "-i", action="store_true", help="Che do tuong tac ban phim (mac dinh da bat)")
     args = parser.parse_args(argv)
 
     sim = SensorSimulator(broker_host=args.host, broker_port=args.port)

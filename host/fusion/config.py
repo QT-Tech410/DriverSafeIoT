@@ -51,12 +51,13 @@ def load_config(config_path: str | None = None) -> FusionConfig:
 def _merge_defaults(cfg: dict) -> FusionConfig:
     """Merge user-provided config với hard-coded defaults."""
     mqtt_cfg = cfg.get("mqtt", {})
+    fusion_cfg = cfg.get("fusion", {})
 
     return FusionConfig(
         broker_host=mqtt_cfg.get("broker_host", "127.0.0.1"),
         broker_port=mqtt_cfg.get("broker_port", 1883),
-        client_id=mqtt_cfg.get("client_id", "fusion_subscriber"),
+        client_id=fusion_cfg.get("client_id", "fusion_engine"),
         keepalive=mqtt_cfg.get("keepalive", 60),
-        vision_timeout_s=cfg.get("fusion", {}).get("vision_timeout_s", 2.0),
-        esp32_timeout_s=cfg.get("fusion", {}).get("esp32_timeout_s", 5.0),
+        vision_timeout_s=fusion_cfg.get("vision_timeout_s", 2.0),
+        esp32_timeout_s=fusion_cfg.get("esp32_timeout_s", 5.0),
     )

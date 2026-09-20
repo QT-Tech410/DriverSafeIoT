@@ -123,10 +123,16 @@ class MqttBridge(mqtt.Client):
         elif topic == TOPIC_ESP32_SENSORS:
             self.latest_esp32 = payload
             self.last_esp32_ts = now
+            # Nếu Fusion Engine chưa chạy, tự động phát sóng telemetry cảm biến xuống Web
+            # để người dùng thấy ngay nhiệt độ, nồng độ cồn, ánh sáng nhảy realtime
+            if not self.is_fusion_online():
+                self._on_standalone_sensor_update()
 
         elif topic == TOPIC_VISION_METRICS:
             self.latest_vision = payload
             self.last_vision_ts = now
+            if not self.is_fusion_online():
+                self._on_standalone_sensor_update()
 
         elif topic in (TOPIC_EVENTS, TOPIC_VISION_EVENTS, TOPIC_ESP32_EVENTS):
             self._on_event_message(topic, payload)
@@ -140,16 +146,19 @@ class MqttBridge(mqtt.Client):
             # Forward cmd tới websocket
             self._dispatch_ws({"type": "command", "data": payload})
 
-    def _on_fusion_cycle(self, fusion_payload: dict) -> None:
-        """Được gọi mỗi khi nhận được kết quả Fusion 1Hz -> Lưu DB và Broadcast WS."""
-        now_ms = int(time.time() * 1000)
+    def is_fusion_online(self) -> bool:
+        """Kiểm tra node Fusion có đang hoạt động trong vòng 3 giây gần nhất không."""
+        return (time.time() - self.last_fusion_ts) <= 3.0 if self.last_fusion_ts > 0 else False
 
-        record = TelemetryRecord(
-            ts=fusion_payload.get("ts", now_ms),
-            risk=float(fusion_payload.get("risk", 0.0)),
-            band=str(fusion_payload.get("band", "SAFE")),  # type: ignore
-            drivers=list(fusion_payload.get("drivers", [])),
-            action=str(fusion_payload.get("action", "none")),
+    def build_current_telemetry(self) -> TelemetryRecord:
+        """Tổng hợp bản ghi Telemetry mới nhất từ các nguồn Fusion, ESP32 và Vision."""
+        now_ms = int(time.time() * 1000)
+        return TelemetryRecord(
+            ts=self.latest_fusion.get("ts", now_ms),
+            risk=float(self.latest_fusion.get("risk", 0.0)),
+            band=str(self.latest_fusion.get("band", "SAFE")),  # type: ignore
+            drivers=list(self.latest_fusion.get("drivers", [])),
+            action=str(self.latest_fusion.get("action", "none")),
             perclos_60s=float(self.latest_vision.get("perclos_60s", 0.0)),
             ear=float(self.latest_vision.get("ear", 0.0)),
             cles_dur_ms=float(self.latest_vision.get("cles_dur_ms", 0.0)),
@@ -164,6 +173,25 @@ class MqttBridge(mqtt.Client):
             ldr_pct=int(self.latest_esp32.get("ldr_pct", 50)),
             rssi=int(self.latest_esp32.get("rssi", -60)),
         )
+
+    def _on_standalone_sensor_update(self) -> None:
+        """Cập nhật dữ liệu tức thời xuống Web khi Fusion Engine chưa khởi động."""
+        record = self.build_current_telemetry()
+        try:
+            self.db.insert_telemetry(record)
+        except Exception:
+            pass
+
+        ws_msg = {
+            "type": "telemetry",
+            "data": record.as_dict(),
+            "status": self.get_system_status().as_dict(),
+        }
+        self._dispatch_ws(ws_msg)
+
+    def _on_fusion_cycle(self, fusion_payload: dict) -> None:
+        """Được gọi mỗi khi nhận được kết quả Fusion 1Hz -> Lưu DB và Broadcast WS."""
+        record = self.build_current_telemetry()
 
         # 1. Lưu SQLite Database
         try:

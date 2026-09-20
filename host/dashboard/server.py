@@ -21,7 +21,7 @@ import sys
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
@@ -30,6 +30,7 @@ import uvicorn
 DASHBOARD_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(DASHBOARD_DIR))
 
+from camera_stream import WebCameraStreamer
 from db import Database
 from models import SystemStatus
 from mqtt_bridge import MqttBridge
@@ -41,6 +42,7 @@ STATIC_DIR.mkdir(parents=True, exist_ok=True)
 # Khởi tạo các singleton service
 db = Database()
 ws_manager = WebSocketManager()
+camera_streamer = WebCameraStreamer()
 mqtt_bridge: MqttBridge | None = None
 
 
@@ -61,10 +63,12 @@ async def lifespan(app: FastAPI):
     )
     print("[dashboard.server] Dang ket noi MQTT Bridge...")
     mqtt_bridge.connect_broker(timeout=3.0)
+    camera_streamer.start()
 
     yield
 
     # Cleanup khi shutdown
+    camera_streamer.stop()
     if mqtt_bridge:
         print("[dashboard.server] Dang ngat ket noi MQTT Bridge...")
         mqtt_bridge.disconnect_broker()
@@ -137,6 +141,15 @@ async def send_command(req: CommandRequest) -> dict:
     return {"status": "ok", "sent": cmd_dict}
 
 
+@app.get("/api/video_feed")
+async def video_feed():
+    """Stream luồng video MJPEG có vẽ landmarks và metrics cho Dashboard."""
+    return StreamingResponse(
+        camera_streamer.stream_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """Kênh WebSocket stream dữ liệu thời gian thực cho trình duyệt."""
@@ -147,12 +160,14 @@ async def websocket_endpoint(websocket: WebSocket):
         init_telemetry = [r.as_dict() for r in db.get_recent_telemetry(limit=60)]
         init_events = [e.as_dict() for e in db.get_recent_events(limit=20)]
         status = mqtt_bridge.get_system_status().as_dict() if mqtt_bridge else SystemStatus().as_dict()
+        latest_telemetry = mqtt_bridge.build_current_telemetry().as_dict() if mqtt_bridge else None
 
         init_msg = {
             "type": "init",
             "status": status,
             "recent_telemetry": init_telemetry,
             "recent_events": init_events,
+            "latest_telemetry": latest_telemetry,
         }
         await websocket.send_json(init_msg)
 

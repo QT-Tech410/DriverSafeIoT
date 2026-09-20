@@ -27,9 +27,9 @@ esp32:
 temporal:
   buffer_seconds: 60
   sample_freq_hz: 10
-  # Ngưỡng event theo spec §6.2
-  T_CLOSED_SEC: 0.20      # Eye closure ≥ 200ms
-  MICROSLEEP_MS: 500      # Eye closure ≥ 500ms = microsleep
+  # Ngưỡng event theo spec §6.2 & eye_tracking_fix_guide.md
+  T_CLOSED_SEC: 0.22      # Eye closure (chuẩn hóa người châu Á/mí lót)
+  MICROSLEEP_MS: 1200     # Eye closure ≥ 1200ms = microsleep (1.2s giấc ngủ trắng)
   EYE_CLOSURE_MS: 250     # Eye closure ≥ 250ms = eye_closure event
   HEAD_DROP_MS: 800       # Head drop ≥ 800ms = event
   YAWN_MS: 400            # Yawn ≥ 400ms = event
@@ -37,6 +37,7 @@ temporal:
   FACE_LOST_MS: 2000      # Không thấy face ≥ 2000ms = face_lost
 
 fusion:
+  client_id: fusion_engine
   # Timeout độ tươi dữ liệu (spec §8, §3)
   vision_timeout_s: 2.0    # Mất vision > 2s -> fallback sang nhánh cảm biến
   esp32_timeout_s: 5.0     # Mất ESP32 > 5s -> degraded mode tự chủ

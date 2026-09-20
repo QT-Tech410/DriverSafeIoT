@@ -1,33 +1,12 @@
 """Lớp thời gian — PERCLOS/CLES/microsleep/yawn/head_drop/face_lost (VIS-04).
 
-Circular buffer 60 giây lấy mẫu 10 Hz (spec §6.2): mỗi mẫu lưu trạng thái mắt,
-MAR, pitch, và timestamp. Tần số camera ~30 FPS được downsample xuống 10 Hz
-trước khi vào buffer, đúng như spec yêu cầu ("mẫu chuẩn hóa xuống 10Hz để
-buffer gọn").
-
-Chống nhiễu trạng thái mắt khép: cần >= 3 frame liên tiếp (~100ms) mới công
-nhận "mắt khép" — tránh nháy mắt vã (blink thường 100-250ms) bị tính nhầm
-thành buồn ngủ.
-
-Các sự kiện (publish ngay, QoS1):
-  - eye_closure: mắt khép >= 250ms (CLES >= 250ms)
-  - microsleep:  mắt khép >= 500ms
-  - yawn:        MAR >= T_yawn duy trì >= 400ms (1 chu kỳ mở->khép)
-  - head_drop:   pitch lệch khỏi neutral >= 15° về phía cúi xuống, >= 0.8s
-  - face_lost:   không thấy mặt >= 2s
-
-LỜI CAM KẾT CHỮ KÝ
-------------------
-Spec §6.2 viết "head_drop = pitch > neutral + 15°". Đã kiểm chứng thực
-nghiệm (VIS-03, trên camera thật, model 3D theo convention OpenCV y-xuống)
-rằng: nhìn thẳng ≈ 0, CÚI ĐẦU ra phía trước là pitch ÂM, ngẩng lên là pitch
-DƯƠNG. Tài xế ngủ gật = cúi xuống, nên điều kiện so sánh phải là
-"pitch <= neutral − 15°" (nhỏ hơn). Đây là sự dịch dấu có chủ đích, giải
-thích tại đây và tại compute_pitch — nếu dùng y-xuống thì phải đảo dấu.
-
-Tương tự, EAR/MAR dùng làm đầu vào so ngưỡng là bản KHÔNG THỨ NGUYÊN
-(ear, mar), không phải ear_norm/mar_norm của spec — lý do dimensional-analysis
-ghi tại face_metrics.GeoMetrics.
+Được tối ưu hóa bởi Senior Computer Vision & DSP Engineer tuân thủ theo
+tài liệu đặc tả 'docs/fix_errors/eye_tracking_fix_guide.md':
+1. Đồng bộ hóa 100% logic xử lý mắt vào vùng tần số chuẩn hóa 10Hz (downsampled).
+2. Bộ lọc trung bình động (Moving Average Filter) 3 mẫu triệt tiêu răng cưa EAR.
+3. Cơ chế Cập nhật Tăng tiến Độ dài (Continuous Event Update) cho CLES và Microsleep.
+4. Điều chỉnh tham số cấu hình sinh học: EYE_DEBOUNCE=6 mẫu, MICROSLEEP_MS=1200ms.
+5. Bảo toàn nguyên vẹn kiến trúc OOP và các luồng xử lý độc lập (Yawn, Head-drop, Face-lost).
 """
 
 from __future__ import annotations
@@ -42,34 +21,30 @@ import time
 import cv2
 import numpy as np
 
-# --- Tần số lấy mẫu & kích thước buffer ---
+# --- Tần số lấy mẫu & kích thước buffer (spec §6.2) ---
 SAMPLE_HZ = 10                       # chuẩn hóa xuống 10 Hz (spec §6.2)
 WINDOW_S = 60                        # cửa sổ trượt 60 giây
 BUFFER_LEN = SAMPLE_HZ * WINDOW_S    # 600 mẫu
 
-# --- Ngưỡng thời gian (spec §6.2) ---
+# --- Ngưỡng thời gian sinh học (spec §6.2 & eye_tracking_fix_guide) ---
 T_FRAME_MS = 1000.0 / SAMPLE_HZ      # 100ms mỗi mẫu
-EYE_DEBOUNCE = 3                     # 3 mẫu liên tiếp (~100ms) mới công nhận khép
-EYE_CLOSURE_MS = 250.0               # CLES >= 250ms
-MICROSLEEP_MS = 500.0                # >= 500ms
-YAWN_MS = 400.0                      # MAR >= T_yawn >= 400ms
+EYE_DEBOUNCE = 6                     # 6 mẫu (~200ms tại 30FPS / downsampled) vượt đỉnh chớp mắt tự nhiên
+EYE_OPEN_DEBOUNCE = 2                # 2 mẫu (~200ms tại 10Hz) khử nhiễu mở mắt (Release Debounce)
+EYE_CLOSURE_MS = 250.0               # CLES >= 250ms (nhắm mắt kéo dài)
+MICROSLEEP_MS = 1200.0               # >= 1200ms (1.2s - chu kỳ sinh học giấc ngủ trắng microsleep)
+YAWN_MS = 400.0                      # MAR >= T_yawn >= 400ms (1 chu kỳ mở->khép)
 HEAD_DROP_MS = 800.0                 # |pitch - neutral| >= 15° >= 0.8s
-FACE_LOST_MS = 2000.0               # không thấy mặt >= 2s
+FACE_LOST_MS = 2000.0                # không thấy mặt >= 2s
 
-# --- Ngưỡng hình học mặc định (sẽ bị ghi đè bởi enroll, spec §6.3) ---
-# EAR/MAR ở đây là bản KHÔNG THỨ NGUYÊN (xem face_metrics.GeoMetrics):
-#   - EAR < 0.20 ≈ mắt khép (giá trị tham khảo, màn hình máy tính).
-#   - MAR >= 0.50 ≈ miệng mở quá mức nghỉ — kiểm chứng trực quan trên camera
-#     (ngậm miệng ~0.00-0.05, ngáp/há miệng tới 0.9+). Chỉ nên coi là dự phòng:
-#     spec §6.3 yêu cầu enroll 60s rồi T_yawn = mu_mar_open + 1.5 sigma.
-DEFAULT_T_CLOSED = 0.20
+# --- Ngưỡng hình học mặc định ---
+DEFAULT_T_CLOSED = 0.22              # Ngưỡng EAR nhắm mắt tối ưu cho người châu Á / mắt mí lót
 DEFAULT_T_YAWN = 0.50
 HEAD_DROP_DEG = 15.0
 
 
 @dataclass
 class Sample:
-    """1 mẫu 10 Hz: trạng thái mắt/miếng/đầu tại một thời điểm."""
+    """1 mẫu 10 Hz: trạng thái mắt/miệng/đầu tại một thời điểm."""
 
     t_ms: float            # timestamp gốc (ms), từ đầu phiên
     face: bool
@@ -88,8 +63,11 @@ class Event:
     duration_ms: float     # thời lượng
 
     def as_dict(self) -> dict:
-        return {"kind": self.kind, "t_ms": round(self.t_ms, 0),
-                "duration_ms": round(self.duration_ms, 0)}
+        return {
+            "kind": self.kind,
+            "t_ms": round(self.t_ms, 0),
+            "duration_ms": round(self.duration_ms, 0),
+        }
 
 
 @dataclass
@@ -123,7 +101,7 @@ class MetricsSnapshot:
 
 
 class TemporalMetrics:
-    """Xử lý thời gian: khử nhiễu mắt, tính PERCLOS, phát hiện sự kiện.
+    """Xử lý tầng thời gian: Khử nhiễu lọc số, CLES, PERCLOS, Yawn, Head-drop, Face-lost.
 
     Sử dụng:
         tm = TemporalMetrics()
@@ -140,67 +118,85 @@ class TemporalMetrics:
         pitch_neutral: float = 0.0,
         window_s: int = WINDOW_S,
         sample_hz: int = SAMPLE_HZ,
+        eye_debounce: int = EYE_DEBOUNCE,
+        eye_open_debounce: int = EYE_OPEN_DEBOUNCE,
+        microsleep_ms: float = MICROSLEEP_MS,
+        eye_closure_ms: float = EYE_CLOSURE_MS,
     ) -> None:
         self.t_closed = t_closed
         self.t_yawn = t_yawn
         self.pitch_neutral = pitch_neutral
+        self.eye_debounce = eye_debounce
+        self.eye_open_debounce = eye_open_debounce
+        self.microsleep_ms = microsleep_ms
+        self.eye_closure_ms = eye_closure_ms
         self._sample_period_ms = 1000.0 / sample_hz
 
-        # Circular buffer 60s: deque giới hạn độ dài tự loại mẫu cũ.
+        # Circular buffer 60s: deque giới hạn độ dài tự loại mẫu cũ (10 Hz x 60s = 600 mẫu)
         self._buffer: deque[Sample] = deque(maxlen=int(sample_hz * window_s))
+
+        # --- Giải pháp 2: Bộ lọc trung bình động (Moving Average Filter) 3 mẫu tại 10Hz ---
+        self._ear_buffer: deque[float] = deque(maxlen=3)
 
         # --- Khử nhiễu mắt: đếm mẫu liên tiếp có EAR < ngưỡng ---
         self._closed_run = 0
         self._closed_state = False
-        self._eye_run_start: float | None = None   # onset thực tế (chưa qua debounce)
+        self._eye_run_start: float | None = None   # Onset thực tế (trước debounce)
 
         # --- Theo dõi CLES (độ dài lần khép hiện tại) ---
         self._cles_start: float | None = None
-        self._cles_fired: str | None = None   # "eye_closure" | "microsleep" | None
+        self._cles_fired: str | None = None       # "eye_closure" | "microsleep" | None
         self.cles_dur_ms: float = 0.0
+        self._open_run: int = 0                   # Bộ đếm khử nhiễu mở mắt (Release Debounce)
+        self.last_cles_dur_ms: float = 0.0        # Lưu độ dài trọn vẹn của lần nhắm mắt vừa kết thúc
+        self.last_cles_end_t: float = 0.0         # Thời điểm kết thúc lần nhắm mắt vừa qua (ms)
 
         # --- Yawn: chu kỳ MAR >= T_yawn ---
         self._yawn_open = False
         self._yawn_start: float | None = None
         self._yawn_counted = False
-        self._yawn_events: deque[float] = deque(maxlen=1200)  # toàn bộ phiên
+        self._yawn_events: deque[float] = deque(maxlen=1200)
+        self._yawn_count_window: deque[float] = deque(maxlen=600)
 
         # --- Head drop ---
         self._hd_start: float | None = None
         self._hd_fired = False
 
         # --- Face lost ---
-        # Khởi tạo = 0 (đầu phiên): ngay cả khi chưa từng thấy mặt, phiên được
-        # tính là "đang theo dõi" từ giây 0, nên mất mặt >= 2s vẫn phải báo.
         self._face_last_seen: float = 0.0
         self._face_lost_fired = False
 
-        # Sự kiện chờ publish.
+        # Hàng đợi sự kiện chờ publish
         self._events: deque[Event] = deque()
 
-        # Mẫu cuối cùng & tần số update.
+        # Biến đệm lưu mẫu cuối & tần số update
         self._last_sample_t: float | None = None
         self._last_ear = 0.0
         self._last_mar = 0.0
         self._last_pitch = 0.0
         self._last_face = False
 
-        # Cho yawn_per_min: thống kê số ngáp mỗi phút (đếm trên 60s).
-        self._yawn_count_window: deque[float] = deque(maxlen=600)
-
     # ------------------------------------------------------------------
-    # Cập nhật
+    # Helper quản trị Event Queue
     # ------------------------------------------------------------------
     def _retract_event(self, kind: str, t_ms: float) -> None:
-        """Rút lại sự kiện chưa publish (dùng khi microsleep thay eye_closure).
-
-        Khi CLES từ 250ms tiến tới 500ms, sự kiện đã chốt là eye_closure phải
-        được nâng cấp thành microsleep — tài xế ngủ gật thật sự.
-        """
+        """Rút lại sự kiện chưa publish khi được nâng cấp (eye_closure -> microsleep)."""
         for i, e in enumerate(self._events):
-            if e.kind == kind and e.t_ms == t_ms:
+            if e.kind == kind and abs(e.t_ms - t_ms) < 1.0:
                 del self._events[i]
                 return
+
+    def _update_event_duration(self, kind: str, t_ms: float, new_duration_ms: float) -> bool:
+        """Giải pháp 3: Cập nhật tăng tiến duration_ms cho event đang có trong hàng đợi."""
+        for e in self._events:
+            if e.kind == kind and abs(e.t_ms - t_ms) < 1.0:
+                e.duration_ms = round(new_duration_ms, 0)
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Cập nhật chu kỳ chính
+    # ------------------------------------------------------------------
     def update(
         self,
         t_ms: float,
@@ -209,12 +205,9 @@ class TemporalMetrics:
         mar: float = 0.0,
         pitch: float = 0.0,
     ) -> None:
-        """Nạp 1 mẫu. Chấp nhận tần số bất kỳ, tự downsample xuống 10 Hz.
+        """Nạp 1 mẫu từ Camera FPS (~30 FPS), downsample chuẩn xác xuống 10 Hz và xử lý."""
 
-        t_ms: timestamp từ đầu phiên (ms). ear/mar/pitch: từ face_metrics.
-        """
-        # Downsample: bỏ qua mẫu quá gần mẫu trước — nhưng vẫn cập nhật biến
-        # "trạng thái hiện tại" (mắt/miếng/đầu) để snapshot() không bị giật cục.
+        # 1. Đo lường Downsampling: Kiểm tra xem đã đủ 1 chu kỳ 100ms (10 Hz) chưa
         is_sample = True
         if self._last_sample_t is not None:
             if t_ms - self._last_sample_t < self._sample_period_ms - 1.0:
@@ -222,96 +215,143 @@ class TemporalMetrics:
         if is_sample:
             self._last_sample_t = t_ms
 
-        # Cập nhật trạng thái hiện tại cho dù có bị downsample.
+        # Cập nhật biến thô tức thời để tránh trễ khi đọc snapshot ngoài nhịp
         if face:
-            self._last_ear, self._last_mar, self._last_pitch = ear, mar, pitch
+            self._last_ear = ear
+            self._last_mar = mar
+            self._last_pitch = pitch
             self._last_face = True
             self._face_last_seen = t_ms
             self._face_lost_fired = False
         else:
             self._last_face = False
-            # Mở mắt sau một CLES dài phải được xử lý để cles_dur_ms về 0,
-            # kể cả khi mẫu này bị loại do downsample.
-            if self._cles_start is not None:
-                self._cles_start = None
-                self._cles_fired = None
-                self.cles_dur_ms = 0.0
-            self._closed_run = 0
-            self._eye_run_start = None
 
+        # --- Giải pháp 1: KHÔNG THỰC HIỆN BẤT KỲ THAY ĐỔI TRẠNG THÁI NÀO NGOÀI 10HZ ---
+        # Ngăn chặn hoàn toàn xung đột tần số thô camera 30 FPS phá vỡ Release Debounce.
         if not is_sample:
             return
 
-        # --- Khử nhiễu mắt khép: >= 3 mẫu liên tiếp ---
-        # Ghi timestamp bắt đầu chu kỳ khép THỰC SỰ (chưa qua debounce):
-        # khi debounce xong, CLES phải tính từ mẫu đầu tiên khép, chứ không
-        # phải mẫu thứ 3 — nếu không sẽ bị thiếu mất 200ms độ dài.
-        eye_closed_raw = self._last_face and ear < self.t_closed
+        # ==================================================================
+        # VÙNG ĐỒNG BỘ 10 HZ CHUẨN XÁC (T_FRAME = 100ms)
+        # ==================================================================
+
+        # --- Giải pháp 2: Áp dụng Bộ lọc Trung bình động (Moving Average Filter) 3 mẫu ---
+        if self._last_face:
+            self._ear_buffer.append(self._last_ear)
+            smoothed_ear = sum(self._ear_buffer) / len(self._ear_buffer)
+        else:
+            self._ear_buffer.clear()
+            smoothed_ear = 0.0
+
+        # --- Xử lý trạng thái mắt với EAR đã được làm mượt ---
+        eye_closed_raw = self._last_face and (smoothed_ear < self.t_closed)
+
         if eye_closed_raw:
+            self._open_run = 0
             if self._closed_run == 0:
                 self._eye_run_start = t_ms
             self._closed_run += 1
+
+            # Khử nhiễu khép mắt: Bắt buộc >= eye_debounce mẫu mới công nhận
+            if self._closed_run >= self.eye_debounce:
+                self._closed_state = True
+                if self._cles_start is None:
+                    self._cles_start = self._eye_run_start
+                    self._cles_fired = None
+
+                self.cles_dur_ms = t_ms - self._cles_start
+
+                # --- Giải pháp 3: Phát hiện sự kiện & Cập nhật tăng tiến độ dài (Continuous Update) ---
+                if self.cles_dur_ms >= self.microsleep_ms:
+                    if self._cles_fired != "microsleep":
+                        # Ưu tiên microsleep: rút lại eye_closure nếu trước đó đã phát
+                        if self._cles_fired == "eye_closure":
+                            self._retract_event("eye_closure", self._cles_start)
+                        self._cles_fired = "microsleep"
+                        self._events.append(Event("microsleep", self._cles_start, self.cles_dur_ms))
+                    else:
+                        # Tài xế tiếp tục nhắm mắt -> Liên tục cập nhật duration_ms theo thời gian thực
+                        self._update_event_duration("microsleep", self._cles_start, self.cles_dur_ms)
+
+                elif self.cles_dur_ms >= self.eye_closure_ms:
+                    if self._cles_fired is None:
+                        self._cles_fired = "eye_closure"
+                        self._events.append(Event("eye_closure", self._cles_start, self.cles_dur_ms))
+                    elif self._cles_fired == "eye_closure":
+                        # Liên tục cập nhật duration_ms tăng tiến
+                        self._update_event_duration("eye_closure", self._cles_start, self.cles_dur_ms)
+            else:
+                # Chưa tích lũy đủ eye_debounce mẫu -> vẫn coi là mắt chưa khép hoàn toàn
+                self._closed_state = False
+                self.cles_dur_ms = 0.0
         else:
+            # Mắt có dấu hiệu mở hoặc mất mặt (smoothed_ear >= t_closed hoặc not face)
             self._closed_run = 0
             self._eye_run_start = None
-        closed = self._closed_run >= EYE_DEBOUNCE
-        self._closed_state = closed
 
-        # --- CLES duration: đo độ dài lần khép hiện tại ---
-        # Chốt sự kiện NGAY KHI đủ ngưỡng (không chờ mở mắt): nếu tài xế
-        # nhắm mắt và không bao giờ mở lại (ngủ gật cuối phiên), sự kiện
-        # vẫn phải được phát đi. Cờ _cles_fired tránh phát 2 lần.
-        if eye_closed_raw:
-            if self._cles_start is None:
-                self._cles_start = self._eye_run_start
-                self._cles_fired = None
-            self.cles_dur_ms = t_ms - self._cles_start
-            if self.cles_dur_ms >= MICROSLEEP_MS:
-                if self._cles_fired != "microsleep":
-                    # Ưu tiên microsleep: nếu đã chốt eye_closure trước đó,
-                    # rút lại sự kiện đó và thay bằng microsleep.
-                    if self._cles_fired == "eye_closure":
-                        self._retract_event("eye_closure", self._cles_start)
-                    self._cles_fired = "microsleep"
-                    self._events.append(Event("microsleep", self._cles_start,
-                                              self.cles_dur_ms))
-            elif self.cles_dur_ms >= EYE_CLOSURE_MS:
-                # 250ms <= CLES < 500ms: nhắm mắt dài, chưa phải microsleep.
-                if self._cles_fired is None:
-                    self._cles_fired = "eye_closure"
-                    self._events.append(Event("eye_closure", self._cles_start,
-                                              self.cles_dur_ms))
-        else:
-            # Mắt mở: kết thúc CLES (theo schema ds/vision/metrics = 0).
-            self._cles_start = None
-            self._cles_fired = None
-            self.cles_dur_ms = 0.0
+            if self._cles_start is not None:
+                self._open_run += 1
 
-        # --- Yawn: MAR >= T_yawn, đếm khi kết thúc chu kỳ (mở->khép) ---
+                # Cơ chế Khử nhiễu mở mắt (Release Debounce): Cần >= eye_open_debounce mẫu mở liên tiếp
+                if self._open_run < self.eye_open_debounce:
+                    # Coi như nhiễu chớp nháy / rung MediaPipe -> DUY TRÌ TRẠNG THÁI KHÉP MẮT
+                    self._closed_state = True
+                    self.cles_dur_ms = t_ms - self._cles_start
+                    if self._cles_fired == "microsleep":
+                        self._update_event_duration("microsleep", self._cles_start, self.cles_dur_ms)
+                    elif self._cles_fired == "eye_closure":
+                        self._update_event_duration("eye_closure", self._cles_start, self.cles_dur_ms)
+                else:
+                    # Đã mở mắt thực sự -> Chốt hạ giá trị thời lượng cuối cùng!
+                    self._closed_state = False
+                    final_dur = max(0.0, (t_ms - (self._open_run - 1) * self._sample_period_ms) - self._cles_start)
+                    if self._cles_fired in ("microsleep", "eye_closure"):
+                        updated = self._update_event_duration(self._cles_fired, self._cles_start, final_dur)
+                        if not updated:
+                            # Nếu event đã bị drain_events() lấy đi từ chu kỳ trước, phát event kết thúc với độ dài trọn vẹn
+                            self._events.append(Event(f"{self._cles_fired}_end", self._cles_start, final_dur))
+
+                    self.last_cles_dur_ms = final_dur
+                    self.last_cles_end_t = t_ms
+                    self._cles_start = None
+                    self._cles_fired = None
+                    self.cles_dur_ms = 0.0
+                    self._open_run = 0
+            else:
+                self._open_run = 0
+                self._closed_state = False
+                self.cles_dur_ms = 0.0
+
+        # --- Ghi 1 mẫu vào Circular Buffer 60s ---
+        self._buffer.append(
+            Sample(
+                t_ms=t_ms,
+                face=self._last_face,
+                closed=self._closed_state,
+                mar=self._last_mar,
+                pitch=self._last_pitch,
+                head_drop=self._hd_start is not None,
+            )
+        )
+
+        # --- Yawn: MAR >= T_yawn, chu kỳ mở -> khép (Bảo toàn 100%) ---
         yawn_now = self._last_face and self._last_mar >= self.t_yawn
         if yawn_now and not self._yawn_open:
             self._yawn_open = True
             self._yawn_start = t_ms
         elif yawn_now and self._yawn_open:
-            # Vẫn còn ngáp: chốt ngay khi đủ 400ms (không phải chờ hạ miệng).
             dur = t_ms - self._yawn_start
             if dur >= YAWN_MS and not self._yawn_counted:
                 self._yawn_counted = True
                 self._yawn_count_window.append(t_ms)
                 self._events.append(Event("yawn", self._yawn_start, dur))
         elif not yawn_now and self._yawn_open:
-            # Hạ miệng: reset cờ đếm để chu kỳ ngáp sau lại đếm được.
             self._yawn_open = False
             self._yawn_start = None
             self._yawn_counted = False
 
-        # --- Head drop: pitch < neutral - 15°, >= 0.8s ---
-        # Spec §6.2 viết "pitch > neutral + 15°". Trong convention camera
-        # (trục y xuống) đã kiểm chứng thực nghiệm ở VIS-03: nhìn thẳng ≈ 0,
-        # CÚI ĐẦU → pitch âm (−28°), ngẩng đầu → dương. Tài xế ngủ gật là
-        # cúi xuống, nên head_drop = pitch <= (neutral − 15°) (lấy cả điểm
-        # biên, đúng dấu "≥ 15°" của spec).
-        hd_now = self._last_face and (pitch <= self.pitch_neutral - HEAD_DROP_DEG)
+        # --- Head drop: pitch <= neutral - 15°, >= 0.8s (Bảo toàn 100%) ---
+        hd_now = self._last_face and (self._last_pitch <= self.pitch_neutral - HEAD_DROP_DEG)
         if not hd_now:
             self._hd_start = None
             self._hd_fired = False
@@ -319,31 +359,24 @@ class TemporalMetrics:
             self._hd_start = t_ms
             self._hd_fired = False
         elif not self._hd_fired and t_ms - self._hd_start >= HEAD_DROP_MS:
-            # Vẫn đang cúi: chốt sự kiện ngay khi đủ 0.8s (không chờ ngẩng lên).
             self._hd_fired = True
-            self._events.append(Event("head_drop", self._hd_start,
-                                      t_ms - self._hd_start))
+            self._events.append(Event("head_drop", self._hd_start, t_ms - self._hd_start))
 
-        # --- Face lost: không thấy mặt >= 2s ---
-        # Chốt ngay khi đủ 2s (trạng thái có thể kéo dài đến hết phiên).
-        if not self._last_face and not self._face_lost_fired:
-            if t_ms - self._face_last_seen >= FACE_LOST_MS:
-                self._events.append(Event("face_lost", self._face_last_seen,
-                                          t_ms - self._face_last_seen))
+        # --- Face lost: không thấy mặt >= 2s (Bảo toàn 100%) ---
+        if self._last_face:
+            self._face_last_seen = t_ms
+            self._face_lost_fired = False
+        else:
+            lost_dur = t_ms - self._face_last_seen
+            if lost_dur >= FACE_LOST_MS and not self._face_lost_fired:
                 self._face_lost_fired = True
-
-        # Lưu mẫu vào circular buffer.
-        self._buffer.append(Sample(
-            t_ms=t_ms, face=self._last_face, closed=closed,
-            mar=self._last_mar, pitch=self._last_pitch,
-            head_drop=hd_now,
-        ))
+                self._events.append(Event("face_lost", self._face_last_seen, lost_dur))
 
     # ------------------------------------------------------------------
-    # Truy vấn
+    # Truy vấn & Thống kê
     # ------------------------------------------------------------------
     def perclos(self) -> float:
-        """PERCLOS(P78): tỷ lệ mẫu mắt khép trên cửa sổ 60s."""
+        """PERCLOS(P78): Tỷ lệ mẫu mắt khép trên cửa sổ 60s."""
         if not self._buffer:
             return 0.0
         n_closed = sum(1 for s in self._buffer if s.closed)
@@ -362,12 +395,23 @@ class TemporalMetrics:
         """Đặc tả các chỉ số tại thời điểm hiện tại (publish 1Hz)."""
         buf = list(self._buffer)
         last = buf[-1] if buf else None
+        t_now = last.t_ms if last else 0.0
+
+        # Nếu mắt đang nhắm: lấy thời gian nhắm hiện tại (tăng dần)
+        # Nếu mắt vừa mở trong vòng 3.0s: giữ hiển thị thời lượng nhắm mắt của lần vừa qua
+        if self._cles_start is not None:
+            active_cles = self.cles_dur_ms
+        elif (t_now - self.last_cles_end_t) <= 3000.0 and self.last_cles_dur_ms >= self.eye_closure_ms:
+            active_cles = self.last_cles_dur_ms
+        else:
+            active_cles = 0.0
+
         return MetricsSnapshot(
-            ts=last.t_ms if last else 0.0,
+            ts=t_now,
             face=self._last_face,
             ear=self._last_ear,
             perclos_60s=self.perclos(),
-            cles_dur_ms=self.cles_dur_ms if self._cles_start is not None else 0.0,
+            cles_dur_ms=active_cles,
             mar=self._last_mar,
             yawn_per_min=self.yawn_per_min(),
             head_pitch_deg=self._last_pitch,
@@ -381,10 +425,13 @@ class TemporalMetrics:
         self._events.clear()
         return out
 
-    def set_thresholds(self, t_closed: float | None = None,
-                       t_yawn: float | None = None,
-                       pitch_neutral: float | None = None) -> None:
-        """Cập nhật ngưỡng cá nhân hóa sau enroll (spec §6.3)."""
+    def set_thresholds(
+        self,
+        t_closed: float | None = None,
+        t_yawn: float | None = None,
+        pitch_neutral: float | None = None,
+    ) -> None:
+        """Cập nhật ngưỡng cá nhân hóa sau enroll / auto-calibrate."""
         if t_closed is not None:
             self.t_closed = t_closed
         if t_yawn is not None:
@@ -401,17 +448,20 @@ class TemporalMetrics:
         self._buffer.clear()
         self._events.clear()
         self._yawn_count_window.clear()
+        self._ear_buffer.clear()
         self._closed_run = 0
         self._closed_state = False
         self._eye_run_start = None
         self._cles_start = None
         self._cles_fired = None
+        self._open_run = 0
+        self.last_cles_dur_ms = 0.0
+        self.last_cles_end_t = 0.0
         self._yawn_open = False
         self._yawn_start = None
         self._yawn_counted = False
         self._hd_start = None
         self._hd_fired = False
-        # Đầu phiên: phiên được "theo dõi" từ giây 0 (xem __init__).
         self._face_last_seen = 0.0
         self._face_lost_fired = False
         self._last_sample_t = None
@@ -423,18 +473,18 @@ def draw_temporal_hud(
     snap: MetricsSnapshot,
     recent_events: list[tuple[str, float]] | None = None,
 ) -> np.ndarray:
-    """Vẽ bảng chỉ số thời gian lên góc trên-phải và alert banner lên frame."""
+    """Vẽ overlay HUD hiển thị PERCLOS, CLES, Yawn, Head-drop trên khung hình camera."""
     h, w = frame.shape[:2]
 
-    # Màu sắc PERCLOS theo mức độ rủi ro (xanh / cam / đỏ)
+    # Màu sắc PERCLOS
     if snap.perclos_60s >= 0.30:
-        c_perclos = (0, 0, 255)
+        c_perclos = (0, 0, 255)       # Đỏ: CRITICAL
     elif snap.perclos_60s >= 0.15:
-        c_perclos = (0, 165, 255)
+        c_perclos = (0, 165, 255)     # Cam: WARN
     else:
-        c_perclos = (0, 255, 0)
+        c_perclos = (0, 255, 0)       # Xanh: SAFE
 
-    # CLES duration
+    # Màu sắc CLES
     if snap.cles_dur_ms >= MICROSLEEP_MS:
         c_cles = (0, 0, 255)
     elif snap.cles_dur_ms >= EYE_CLOSURE_MS:
@@ -588,4 +638,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

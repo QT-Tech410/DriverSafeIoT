@@ -187,7 +187,7 @@ class VisionPublisher(mqtt.Client):
         return info.rc == mqtt.MQTT_ERR_SUCCESS
 
 
-def draw_publisher_hud(frame: np.ndarray, pub: VisionPublisher) -> np.ndarray:
+def draw_publisher_hud(frame: np.ndarray, pub: VisionPublisher, t_closed: float = 0.22) -> np.ndarray:
     """Vẽ trạng thái kết nối MQTT và số lượng gói tin đã gửi lên màn hình camera."""
     h = frame.shape[0]
 
@@ -199,7 +199,7 @@ def draw_publisher_hud(frame: np.ndarray, pub: VisionPublisher) -> np.ndarray:
         mqtt_status = f"MQTT: OFFLINE ({pub.broker_host}:{pub.broker_port})"
         c_mqtt = (0, 0, 255)
 
-    info_line = f"PUB: {pub.publish_count} pkts @ 1Hz | EV: {pub.event_publish_count} | LUX: {pub.current_lux_mode.upper()}"
+    info_line = f"PUB: {pub.publish_count} pkts @ 1Hz | EV: {pub.event_publish_count} | T_close: {t_closed:.3f} (+/-/c)"
 
     cv2.putText(frame, mqtt_status, (12, h - 80), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
     cv2.putText(frame, mqtt_status, (12, h - 80), cv2.FONT_HERSHEY_SIMPLEX, 0.55, c_mqtt, 2, cv2.LINE_AA)
@@ -223,6 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default=None, help="Duong dan den face_landmarker.task")
     p.add_argument("--headless", action="store_true", help="Chay khong mo cua so GUI")
     p.add_argument("--duration", type=float, default=0.0, help="Thoi gian chay (giay), 0 = chay mai")
+    p.add_argument("--t-closed", type=float, default=None, help="Nguong EAR nham mat (mac dinh doc tu config.yaml hoac 0.22)")
     return p
 
 
@@ -265,14 +266,16 @@ def main(argv: list[str] | None = None) -> int:
         pub.disconnect_broker()
         return 1
 
-    tm = TemporalMetrics()
+    initial_t_closed = args.t_closed if args.t_closed is not None else getattr(cfg.temporal, "T_CLOSED_SEC", 0.22)
+    tm = TemporalMetrics(t_closed=initial_t_closed)
     meter = FpsMeter()
     t_start = time.perf_counter()
     last_1hz_pub = t_start
     src_label = args.url if args.src == "mjpeg" else f"webcam[{args.index}]"
     recent_events: list[tuple[str, float]] = []
 
-    print("[publisher] Pipeline Vision Publisher san sang. Nhan q/ESC tren cua so camera de dung.")
+    print(f"[publisher] Pipeline Vision san sang (Nguong EAR nham mat T_closed={tm.t_closed:.3f}).")
+    print("[publisher] Phim tat tren camera: [+] tang nguong, [-] giam nguong, [c] auto-calib mat, [q] thoat.")
 
     try:
         while True:
@@ -297,7 +300,12 @@ def main(argv: list[str] | None = None) -> int:
             for ev in events:
                 recent_events.append((ev.kind, now))
                 pub.publish_event(ev)
-                print(f"[publisher EVENT] {ev.kind.upper():<12} | bat dau: {ev.t_ms:.0f}ms | do dai: {ev.duration_ms:.0f}ms")
+                if ev.kind == "microsleep_end":
+                    print(f"\n[publisher EVENT] >>> MICROSLEEP HOAN TAT <<< | Mo mat sau: {ev.duration_ms:.0f}ms")
+                elif ev.kind == "eye_closure_end":
+                    print(f"\n[publisher EVENT] >>> EYE_CLOSURE KET THUC <<< | Mo mat sau: {ev.duration_ms:.0f}ms")
+                else:
+                    print(f"[publisher EVENT] {ev.kind.upper():<12} | bat dau: {ev.t_ms:.0f}ms | do dai: {ev.duration_ms:.0f}ms")
 
             # Publish metrics 1Hz định kỳ (QoS 0)
             if now - last_1hz_pub >= 1.0:
@@ -318,13 +326,27 @@ def main(argv: list[str] | None = None) -> int:
                 draw_status(frame, result)
                 draw_metrics(frame, result, geo)
                 draw_temporal_hud(frame, tm.snapshot(), recent_events)
-                draw_publisher_hud(frame, pub)
+                draw_publisher_hud(frame, pub, t_closed=tm.t_closed)
                 frame = draw_hud(frame, meter.fps, src_label)
                 cv2.imshow("DriverSafe-IoT | Vision Publisher", frame)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
+                elif key in (ord("+"), ord("=")):
+                    new_t = round(tm.t_closed + 0.01, 3)
+                    tm.set_thresholds(t_closed=new_t)
+                    print(f"[publisher] [+] Tang nguong EAR t_closed len: {new_t:.3f}")
+                elif key in (ord("-"), ord("_")):
+                    new_t = round(max(0.12, tm.t_closed - 0.01), 3)
+                    tm.set_thresholds(t_closed=new_t)
+                    print(f"[publisher] [-] Giam nguong EAR t_closed xuong: {new_t:.3f}")
+                elif key == ord("c"):
+                    # Tự động hiệu chuẩn theo mắt hiện tại đang mở (hệ số 0.80 theo eye_tracking_fix_guide.md)
+                    if result.present and geo.ear > 0.15:
+                        calib_t = round(geo.ear * 0.80, 3)
+                        tm.set_thresholds(t_closed=calib_t)
+                        print(f"\n[publisher CALIB] Da tu dong can chinh: EAR mo mat={geo.ear:.3f} -> Nguong nham mat t_closed={calib_t:.3f}\n")
 
             if args.duration and (now - t_start) >= args.duration:
                 break

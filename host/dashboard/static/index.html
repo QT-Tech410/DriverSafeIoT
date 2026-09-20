@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="vi" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DriverSafe-IoT | Realtime Safety Cockpit Dashboard</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <!-- Custom Styling -->
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="min-h-screen p-4 md:p-6 antialiased selection:bg-indigo-500 selection:text-white">
+
+  <!-- Cảnh báo khẩn cấp toàn màn hình (Tự động bật khi ALARM+) -->
+  <div id="critical-fullscreen-alert" class="hidden critical-overlay-alert">
+    <div class="fixed top-4 left-1/2 transform -translate-x-1/2 bg-red-600/90 text-white px-8 py-3 rounded-full shadow-2xl border-2 border-red-300 flex items-center space-x-3 pointer-events-auto backdrop-blur-md">
+      <span class="inline-block w-4 h-4 rounded-full bg-white animate-ping"></span>
+      <div>
+        <div id="alert-banner-title" class="font-extrabold text-sm md:text-base tracking-wide uppercase">CẢNH BÁO NGUY HIỂM — NGƯNG LÁI NGAY!</div>
+        <div id="alert-banner-sub" class="text-xs text-red-100 font-medium">Hệ thống an toàn đã kích hoạt mức cảnh báo khẩn cấp.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="max-w-7xl mx-auto space-y-6">
+
+    <!-- Top Navigation & Node Status Badges -->
+    <header class="cockpit-card p-4 flex flex-col md:flex-row items-center justify-between gap-4">
+      <div class="flex items-center space-x-3">
+        <div class="w-10 h-10 rounded-lg bg-indigo-600/30 border border-indigo-500/50 flex items-center justify-center font-bold text-indigo-400 text-lg shadow-inner">
+          🛡️
+        </div>
+        <div>
+          <h1 class="font-bold text-lg text-gray-100 flex items-center gap-2">
+            DriverSafe-IoT <span class="text-xs font-normal px-2 py-0.5 rounded bg-indigo-900/60 text-indigo-300 border border-indigo-500/30">Cockpit v1.0</span>
+          </h1>
+          <p class="text-xs text-gray-400">Hệ thống Giám sát & Hợp nhất Đa cảm biến An toàn Lái xe</p>
+        </div>
+      </div>
+
+      <!-- Trạng thái các Node phân tán theo thời gian thực -->
+      <div class="flex flex-wrap items-center gap-2 text-xs">
+        <div class="flex items-center px-2.5 py-1 rounded bg-gray-900/80 border border-gray-800">
+          <span class="text-gray-400 mr-2">Vision:</span>
+          <span id="node-vision-status" class="badge-offline px-2 py-0.5 rounded font-semibold">OFFLINE</span>
+        </div>
+        <div class="flex items-center px-2.5 py-1 rounded bg-gray-900/80 border border-gray-800">
+          <span class="text-gray-400 mr-2">ESP32:</span>
+          <span id="node-esp32-status" class="badge-offline px-2 py-0.5 rounded font-semibold">OFFLINE</span>
+        </div>
+        <div class="flex items-center px-2.5 py-1 rounded bg-gray-900/80 border border-gray-800">
+          <span class="text-gray-400 mr-2">Fusion:</span>
+          <span id="node-fusion-status" class="badge-offline px-2 py-0.5 rounded font-semibold">OFFLINE</span>
+        </div>
+        <div class="flex items-center px-2.5 py-1 rounded bg-gray-900/80 border border-gray-800">
+          <span class="text-gray-400 mr-2">MQTT:</span>
+          <span id="node-mqtt-status" class="badge-offline px-2 py-0.5 rounded font-semibold">DISC</span>
+        </div>
+        <div class="flex items-center px-2.5 py-1 rounded bg-gray-900/80 border border-gray-800">
+          <span class="text-gray-400 mr-2">WS:</span>
+          <span id="node-ws-status" class="badge-offline px-2 py-0.5 rounded font-semibold">DISC</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Khối 1: Realtime Panel (Risk Gauge + Live Video Feed + System Enforcement) -->
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+
+      <!-- Risk Score Gauge & Summary (4 cols) -->
+      <div class="lg:col-span-4 cockpit-card p-5 flex flex-col justify-between">
+        <div>
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-sm font-bold text-gray-300 uppercase tracking-wider flex items-center">
+              <span class="dot-pulse bg-emerald-500"></span> Điểm Rủi Ro (Mamdani Risk)
+            </h2>
+            <span id="engine-lock-status" class="px-3 py-0.5 rounded-full text-xs font-bold bg-emerald-600/20 text-emerald-400 border border-emerald-500/40">
+              HOẠT ĐỘNG
+            </span>
+          </div>
+
+          <!-- Đồng hồ bán nguyệt HTML5 Canvas -->
+          <div class="gauge-container my-2">
+            <canvas id="riskGaugeCanvas" width="280" height="175"></canvas>
+          </div>
+        </div>
+
+        <div class="space-y-2 mt-4 pt-3 border-t border-gray-800/80 text-xs">
+          <div class="flex justify-between items-center">
+            <span class="text-gray-400">Luật mờ kích hoạt:</span>
+            <div id="active-drivers-list" class="flex flex-wrap gap-1 justify-end">
+              <span class="text-gray-500">None (Normal)</span>
+            </div>
+          </div>
+          <div class="flex justify-between items-center">
+            <span class="text-gray-400">Chính sách hành động:</span>
+            <span id="val-action-policy" class="font-mono font-bold text-indigo-300">NONE</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Video Feed with Landmark Overlay (5 cols) -->
+      <div class="lg:col-span-5 cockpit-card p-5 flex flex-col">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-sm font-bold text-gray-300 uppercase tracking-wider flex items-center gap-2">
+            📷 Video Feed (Face Mesh Overlay)
+          </h2>
+          <span class="text-xs text-gray-400 font-mono">640x480 @ 30 FPS</span>
+        </div>
+
+        <div class="video-wrapper flex-1 flex items-center justify-center border border-gray-800">
+          <div class="live-badge">LIVE AI FEED</div>
+          <!-- Video Stream từ FastAPI Camera Streamer -->
+          <img id="liveVideoFeed" src="/api/video_feed" alt="Driver Safe Video Stream" class="w-full h-full object-cover" onerror="this.src='/static/camera_standby.png';">
+        </div>
+      </div>
+
+      <!-- Quick Controls & System Enforcement (3 cols) -->
+      <div class="lg:col-span-3 cockpit-card p-5 flex flex-col justify-between space-y-4">
+        <div>
+          <h2 class="text-sm font-bold text-gray-300 uppercase tracking-wider mb-3 flex items-center gap-2">
+            ⚡ Điều Khiển Vận Hành
+          </h2>
+          <p class="text-xs text-gray-400 mb-4">Các thao tác khẩn cấp và kích hoạt quy trình Phần cứng IoT.</p>
+
+          <div class="space-y-2.5">
+            <button onclick="sendSystemCommand('unlock')" class="w-full py-2 px-3 rounded bg-emerald-700/40 hover:bg-emerald-600/50 border border-emerald-500/50 text-emerald-200 text-xs font-bold transition flex items-center justify-center gap-2 shadow">
+              🔓 Mở Khóa Động Cơ (Unlock)
+            </button>
+            <button onclick="sendSystemCommand('enroll')" class="w-full py-2 px-3 rounded bg-indigo-700/30 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-200 text-xs font-semibold transition flex items-center justify-center gap-2">
+              👤 Hiệu Chuẩn Lái Xe (Enroll 60s)
+            </button>
+            <button onclick="sendSystemCommand('beep', {n: 1})" class="w-full py-2 px-3 rounded bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-200 text-xs font-semibold transition flex items-center justify-center gap-2">
+              🔊 Thử Còi Beep (Buzzer Test)
+            </button>
+            <button onclick="sendSystemCommand('reset')" class="w-full py-2 px-3 rounded bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 text-xs font-semibold transition flex items-center justify-center gap-2">
+              🔄 Đặt Lại FSM (Reset FSM)
+            </button>
+          </div>
+        </div>
+
+        <div class="p-3 rounded bg-gray-900/90 border border-gray-800 text-xs text-gray-400 space-y-1">
+          <div class="font-bold text-gray-300">Quy tắc an toàn:</div>
+          <div>• Khóa xe: Cồn ALCO=2 xác nhận ≥2/3 lần đo.</div>
+          <div>• Mệt mỏi: Tuyệt đối KHÔNG khóa xe đang chạy.</div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Khối 2: Chi tiết các chỉ số AI Vision & Cảm biến Buồng lái -->
+    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
+
+      <!-- EAR -->
+      <div class="cockpit-card p-3 text-center">
+        <div class="text-xs text-gray-400 mb-1">Mắt (EAR)</div>
+        <div id="val-ear" class="text-lg font-bold font-mono text-blue-400">0.000</div>
+        <div class="text-[10px] text-gray-500">Ngưỡng: 0.20</div>
+      </div>
+
+      <!-- PERCLOS 60s -->
+      <div class="cockpit-card p-3 text-center">
+        <div class="text-xs text-gray-400 mb-1">PERCLOS 60s</div>
+        <div id="val-perclos" class="text-lg font-bold font-mono text-amber-400">0.0%</div>
+        <div class="text-[10px] text-gray-500">Ngưỡng: 15%</div>
+      </div>
+
+      <!-- CLES Duration -->
+      <div class="cockpit-card p-3 text-center">
+        <div class="text-xs text-gray-400 mb-1">Nhắm Mắt (CLES)</div>
+        <div id="val-cles" class="text-lg font-bold font-mono text-purple-400">0 ms</div>
+        <div class="text-[10px] text-gray-500">Nguy cơ: ≥500ms</div>
+      </div>
+
+      <!-- Yawn/min -->
+      <div class="cockpit-card p-3 text-center">
+        <div class="text-xs text-gray-400 mb-1">Ngáp (Yawn/min)</div>
+        <div id="val-yawn" class="text-lg font-bold font-mono text-cyan-400">0.0</div>
+        <div class="text-[10px] text-gray-500">Ngưỡng: ≥2/phút</div>
+      </div>
+
+      <!-- Head Pitch & Drop -->
+      <div class="cockpit-card p-3 text-center">
+        <div class="text-xs text-gray-400 mb-1">Cúi Đầu (Pitch)</div>
+        <div id="val-pitch" class="text-lg font-bold font-mono text-yellow-400">+0.0°</div>
+        <div id="val-head-drop" class="text-[10px] text-gray-400">BÌNH THƯỜNG</div>
+      </div>
+
+      <!-- MQ-3 BrAC -->
+      <div class="cockpit-card p-3 text-center">
+        <div class="text-xs text-gray-400 mb-1">Cồn (BrAC)</div>
+        <div id="val-brac" class="text-lg font-bold font-mono text-red-400">0.000 g/L</div>
+        <div class="text-[10px] text-gray-500">Mức 2: ≥0.3g/L</div>
+      </div>
+
+      <!-- Cabin Temp -->
+      <div class="cockpit-card p-3 text-center">
+        <div class="text-xs text-gray-400 mb-1">Nhiệt Độ (NTC)</div>
+        <div id="val-temp" class="text-lg font-bold font-mono text-emerald-400">25.0 °C</div>
+        <div class="text-[10px] text-gray-500">WARN: ≥35°C</div>
+      </div>
+
+      <!-- Lux & WiFi RSSI -->
+      <div class="cockpit-card p-3 text-center">
+        <div class="text-xs text-gray-400 mb-1">Ánh Sáng (LDR)</div>
+        <div id="val-lux" class="text-lg font-bold font-mono text-gray-200">DAY (50%)</div>
+        <div id="val-rssi" class="text-[10px] font-mono text-gray-400">-60 dBm</div>
+      </div>
+
+    </div>
+
+    <!-- Khối 3: Biểu đồ xu hướng thời gian thực & Dòng thời gian sự kiện -->
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+
+      <!-- Fatigue Trend Chart (4 cols) -->
+      <div class="lg:col-span-4 cockpit-card p-4 flex flex-col h-72">
+        <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">
+          📈 Xu Hướng Mệt Mỏi (PERCLOS & EAR)
+        </h3>
+        <div class="flex-1 relative">
+          <canvas id="fatigueChartCanvas"></canvas>
+        </div>
+      </div>
+
+      <!-- Cabin & Alcohol Trend Chart (4 cols) -->
+      <div class="lg:col-span-4 cockpit-card p-4 flex flex-col h-72">
+        <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">
+          🌡️ Cảm Biến Buồng Lái & Nồng Độ Cồn
+        </h3>
+        <div class="flex-1 relative">
+          <canvas id="cabinChartCanvas"></canvas>
+        </div>
+      </div>
+
+      <!-- Event Timeline List (4 cols) -->
+      <div class="lg:col-span-4 cockpit-card p-4 flex flex-col h-72">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider">
+            ⏱️ Nhật Ký Sự Kiện Rủi Ro (Timeline)
+          </h3>
+          <span class="text-[11px] text-gray-500 font-mono">30 sự kiện gần nhất</span>
+        </div>
+        <div id="events-timeline-list" class="flex-1 overflow-y-auto space-y-1.5 pr-1 text-xs">
+          <!-- Các sự kiện sẽ được app.js render tự động tại đây -->
+          <div class="text-center text-gray-600 py-8">Chưa có sự kiện rủi ro nào ghi nhận</div>
+        </div>
+      </div>
+
+    </div>
+
+  </div>
+
+  <!-- Scripts tách riêng module hóa -->
+  <script src="/static/gauge.js"></script>
+  <script src="/static/charts.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
