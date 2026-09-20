@@ -304,6 +304,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"\n[publisher EVENT] >>> MICROSLEEP HOAN TAT <<< | Mo mat sau: {ev.duration_ms:.0f}ms")
                 elif ev.kind == "eye_closure_end":
                     print(f"\n[publisher EVENT] >>> EYE_CLOSURE KET THUC <<< | Mo mat sau: {ev.duration_ms:.0f}ms")
+                elif ev.kind == "yawn_end":
+                    print(f"\n[publisher EVENT] >>> YAWN HOAN TAT <<< | Khep mieng sau: {ev.duration_ms:.0f}ms")
                 else:
                     print(f"[publisher EVENT] {ev.kind.upper():<12} | bat dau: {ev.t_ms:.0f}ms | do dai: {ev.duration_ms:.0f}ms")
 

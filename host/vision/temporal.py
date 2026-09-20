@@ -33,6 +33,8 @@ EYE_OPEN_DEBOUNCE = 2                # 2 mẫu (~200ms tại 10Hz) khử nhiễu
 EYE_CLOSURE_MS = 250.0               # CLES >= 250ms (nhắm mắt kéo dài)
 MICROSLEEP_MS = 1200.0               # >= 1200ms (1.2s - chu kỳ sinh học giấc ngủ trắng microsleep)
 YAWN_MS = 400.0                      # MAR >= T_yawn >= 400ms (1 chu kỳ mở->khép)
+YAWN_CLOSE_DEBOUNCE = 2              # 2 mẫu (~200ms tại 10Hz) khử nhiễu khép miệng (Release Debounce)
+YAWN_FACE_LOST_TOLERANCE_MS = 1500.0 # Dung thứ mất mặt khi ngáp (che tay / ngửa cổ) tối đa 1.5s
 HEAD_DROP_MS = 800.0                 # |pitch - neutral| >= 15° >= 0.8s
 FACE_LOST_MS = 2000.0                # không thấy mặt >= 2s
 
@@ -135,8 +137,9 @@ class TemporalMetrics:
         # Circular buffer 60s: deque giới hạn độ dài tự loại mẫu cũ (10 Hz x 60s = 600 mẫu)
         self._buffer: deque[Sample] = deque(maxlen=int(sample_hz * window_s))
 
-        # --- Giải pháp 2: Bộ lọc trung bình động (Moving Average Filter) 3 mẫu tại 10Hz ---
+        # --- Bộ lọc trung bình động (Moving Average Filter) 3 mẫu tại 10Hz cho EAR & MAR ---
         self._ear_buffer: deque[float] = deque(maxlen=3)
+        self._mar_buffer: deque[float] = deque(maxlen=3)
 
         # --- Khử nhiễu mắt: đếm mẫu liên tiếp có EAR < ngưỡng ---
         self._closed_run = 0
@@ -151,10 +154,14 @@ class TemporalMetrics:
         self.last_cles_dur_ms: float = 0.0        # Lưu độ dài trọn vẹn của lần nhắm mắt vừa kết thúc
         self.last_cles_end_t: float = 0.0         # Thời điểm kết thúc lần nhắm mắt vừa qua (ms)
 
-        # --- Yawn: chu kỳ MAR >= T_yawn ---
-        self._yawn_open = False
+        # --- Yawn: Chu kỳ MAR >= T_yawn (tối ưu theo yawn_logic_fix.md) ---
+        self._yawn_open: bool = False
         self._yawn_start: float | None = None
-        self._yawn_counted = False
+        self._yawn_counted: bool = False
+        self._yawn_close_run: int = 0             # Bộ đếm khử nhiễu khép miệng (Release Debounce)
+        self._yawn_lost_start: float | None = None # Mốc thời gian mất mặt khi đang ngáp (dung thứ che tay)
+        self.last_yawn_dur_ms: float = 0.0        # Lưu độ dài trọn vẹn của lần ngáp vừa kết thúc
+        self.last_yawn_end_t: float = 0.0         # Thời điểm kết thúc lần ngáp vừa qua (ms)
         self._yawn_events: deque[float] = deque(maxlen=1200)
         self._yawn_count_window: deque[float] = deque(maxlen=600)
 
@@ -235,13 +242,17 @@ class TemporalMetrics:
         # VÙNG ĐỒNG BỘ 10 HZ CHUẨN XÁC (T_FRAME = 100ms)
         # ==================================================================
 
-        # --- Giải pháp 2: Áp dụng Bộ lọc Trung bình động (Moving Average Filter) 3 mẫu ---
+        # --- Áp dụng Bộ lọc Trung bình động (Moving Average Filter) 3 mẫu cho EAR & MAR ---
         if self._last_face:
             self._ear_buffer.append(self._last_ear)
             smoothed_ear = sum(self._ear_buffer) / len(self._ear_buffer)
+            self._mar_buffer.append(self._last_mar)
+            smoothed_mar = sum(self._mar_buffer) / len(self._mar_buffer)
         else:
             self._ear_buffer.clear()
             smoothed_ear = 0.0
+            self._mar_buffer.clear()
+            smoothed_mar = 0.0
 
         # --- Xử lý trạng thái mắt với EAR đã được làm mượt ---
         eye_closed_raw = self._last_face and (smoothed_ear < self.t_closed)
@@ -334,21 +345,81 @@ class TemporalMetrics:
             )
         )
 
-        # --- Yawn: MAR >= T_yawn, chu kỳ mở -> khép (Bảo toàn 100%) ---
-        yawn_now = self._last_face and self._last_mar >= self.t_yawn
-        if yawn_now and not self._yawn_open:
-            self._yawn_open = True
-            self._yawn_start = t_ms
-        elif yawn_now and self._yawn_open:
-            dur = t_ms - self._yawn_start
-            if dur >= YAWN_MS and not self._yawn_counted:
-                self._yawn_counted = True
-                self._yawn_count_window.append(t_ms)
-                self._events.append(Event("yawn", self._yawn_start, dur))
-        elif not yawn_now and self._yawn_open:
-            self._yawn_open = False
-            self._yawn_start = None
-            self._yawn_counted = False
+        # --- Yawn: MAR >= T_yawn, Chu kỳ Mở -> Khép với Continuous Update & Face-Lost Tolerance ---
+        mouth_open_raw = self._last_face and (self._last_mar >= self.t_yawn)
+
+        if mouth_open_raw:
+            self._yawn_close_run = 0
+            self._yawn_lost_start = None
+
+            if not self._yawn_open:
+                self._yawn_open = True
+                self._yawn_start = t_ms
+                self._yawn_counted = False
+            else:
+                dur = t_ms - self._yawn_start
+                if dur >= YAWN_MS:
+                    if not self._yawn_counted:
+                        self._yawn_counted = True
+                        self._yawn_count_window.append(t_ms)
+                        self._events.append(Event("yawn", self._yawn_start, dur))
+                    else:
+                        # Giải pháp 1: Liên tục cập nhật độ dài tăng tiến theo thời gian thực (Continuous Update)
+                        self._update_event_duration("yawn", self._yawn_start, dur)
+        else:
+            if self._yawn_open:
+                if self._last_face:
+                    # Trường hợp A: Tài xế chủ động khép miệng (Vẫn phát hiện khuôn mặt nhưng MAR < t_yawn)
+                    self._yawn_lost_start = None
+                    self._yawn_close_run += 1
+
+                    if self._yawn_close_run < YAWN_CLOSE_DEBOUNCE:
+                        # Khử nhiễu khép miệng: Duy trì chu kỳ ngáp để tránh jitter landmark môi
+                        dur = t_ms - self._yawn_start
+                        if self._yawn_counted:
+                            self._update_event_duration("yawn", self._yawn_start, dur)
+                    else:
+                        # Đã thực sự khép miệng -> Chốt hạ độ dài trọn vẹn của hành vi ngáp
+                        final_dur = max(0.0, (t_ms - (self._yawn_close_run - 1) * self._sample_period_ms) - self._yawn_start)
+                        if self._yawn_counted:
+                            updated = self._update_event_duration("yawn", self._yawn_start, final_dur)
+                            if not updated:
+                                self._events.append(Event("yawn_end", self._yawn_start, final_dur))
+                            self.last_yawn_dur_ms = final_dur
+                            self.last_yawn_end_t = t_ms
+
+                        # Reset trạng thái ngáp sau khi kết thúc chu kỳ
+                        self._yawn_open = False
+                        self._yawn_start = None
+                        self._yawn_counted = False
+                        self._yawn_close_run = 0
+                else:
+                    # Trường hợp B: Mất dấu khuôn mặt khi đang ngáp (do che tay hoặc ngửa cổ)
+                    self._yawn_close_run = 0
+                    if self._yawn_lost_start is None:
+                        self._yawn_lost_start = t_ms
+
+                    lost_gap = t_ms - self._yawn_lost_start
+                    if lost_gap < YAWN_FACE_LOST_TOLERANCE_MS:
+                        # Trong ngưỡng dung thứ (1500ms): KHÔNG reset đột ngột cờ trạng thái ngáp
+                        dur = self._yawn_lost_start - self._yawn_start
+                        if self._yawn_counted:
+                            self._update_event_duration("yawn", self._yawn_start, dur)
+                    else:
+                        # Vượt quá thời gian dung thứ: Chốt hạ thời lượng tại thời điểm trước khi mất mặt
+                        final_dur = max(0.0, self._yawn_lost_start - self._yawn_start)
+                        if self._yawn_counted:
+                            updated = self._update_event_duration("yawn", self._yawn_start, final_dur)
+                            if not updated:
+                                self._events.append(Event("yawn_end", self._yawn_start, final_dur))
+                            self.last_yawn_dur_ms = final_dur
+                            self.last_yawn_end_t = t_ms
+
+                        self._yawn_open = False
+                        self._yawn_start = None
+                        self._yawn_counted = False
+                        self._yawn_close_run = 0
+                        self._yawn_lost_start = None
 
         # --- Head drop: pitch <= neutral - 15°, >= 0.8s (Bảo toàn 100%) ---
         hd_now = self._last_face and (self._last_pitch <= self.pitch_neutral - HEAD_DROP_DEG)
