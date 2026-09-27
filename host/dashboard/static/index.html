@@ -125,10 +125,10 @@
           <p class="text-xs text-gray-400 mb-4">Các thao tác khẩn cấp và kích hoạt quy trình Phần cứng IoT.</p>
 
           <div class="space-y-2.5">
-            <button onclick="sendSystemCommand('unlock')" class="w-full py-2 px-3 rounded bg-emerald-700/40 hover:bg-emerald-600/50 border border-emerald-500/50 text-emerald-200 text-xs font-bold transition flex items-center justify-center gap-2 shadow">
+            <button id="btn-unlock-engine" onclick="sendSystemCommand('unlock')" class="w-full py-2 px-3 rounded bg-emerald-700/40 hover:bg-emerald-600/50 border border-emerald-500/50 text-emerald-200 text-xs font-bold transition flex items-center justify-center gap-2 shadow">
               🔓 Mở Khóa Động Cơ (Unlock)
             </button>
-            <button onclick="sendSystemCommand('enroll')" class="w-full py-2 px-3 rounded bg-indigo-700/30 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-200 text-xs font-semibold transition flex items-center justify-center gap-2">
+            <button id="btn-enroll-driver" onclick="startEnrollProcess()" class="w-full py-2 px-3 rounded bg-indigo-700/30 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-200 text-xs font-semibold transition flex items-center justify-center gap-2">
               👤 Hiệu Chuẩn Lái Xe (Enroll 60s)
             </button>
             <button onclick="sendSystemCommand('beep', {n: 1})" class="w-full py-2 px-3 rounded bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-200 text-xs font-semibold transition flex items-center justify-center gap-2">
@@ -137,6 +137,9 @@
             <button onclick="sendSystemCommand('reset')" class="w-full py-2 px-3 rounded bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 text-xs font-semibold transition flex items-center justify-center gap-2">
               🔄 Đặt Lại FSM (Reset FSM)
             </button>
+            <a id="btn-export-csv" href="/api/history/export" download class="w-full py-2 px-3 rounded bg-blue-700/30 hover:bg-blue-600/40 border border-blue-500/40 text-blue-200 text-xs font-semibold transition flex items-center justify-center gap-2 text-center">
+              📊 Xuất Dữ Liệu Lịch Sử (CSV)
+            </a>
           </div>
         </div>
 
@@ -249,6 +252,41 @@
 
     </div>
 
+  </div>
+
+  <!-- Modal Hiệu Chuẩn Cá Nhân Hóa Lái Xe 60 Giây (DASH-03 / EXP-01) -->
+  <div id="enroll-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+    <div class="cockpit-card max-w-md w-full p-6 space-y-4 border border-indigo-500/50 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-gray-800 pb-3">
+        <h3 class="font-bold text-gray-100 flex items-center gap-2">
+          <span>👤</span> Quy Trình Hiệu Chuẩn Lái Xe (60 Giây)
+        </h3>
+        <button onclick="cancelEnrollProcess()" class="text-gray-400 hover:text-white text-lg">&times;</button>
+      </div>
+      <div class="text-xs text-gray-300 space-y-2">
+        <p class="font-semibold text-indigo-300">Vui lòng giữ tư thế lái xe chuẩn trong 60 giây:</p>
+        <ul class="list-disc list-inside space-y-1 text-gray-400">
+          <li>Ngồi thẳng lưng, mắt mở tự nhiên nhìn thẳng về phía trước</li>
+          <li>Không nói chuyện hoặc cử động đầu quá mạnh</li>
+          <li>Hệ thống AI sẽ tự động tính ngưỡng EAR nhắm mắt và góc nghiêng đầu neutral của bạn</li>
+        </ul>
+      </div>
+      <!-- Đồng hồ đếm ngược và Progress bar -->
+      <div class="space-y-2 pt-2">
+        <div class="flex justify-between text-xs font-mono">
+          <span class="text-gray-400">Thời gian còn lại:</span>
+          <span id="enroll-countdown" class="text-indigo-400 font-bold text-sm">60s</span>
+        </div>
+        <div class="w-full bg-gray-800 rounded-full h-3 overflow-hidden border border-gray-700">
+          <div id="enroll-progress-bar" class="bg-indigo-600 h-3 rounded-full transition-all duration-1000" style="width: 0%"></div>
+        </div>
+      </div>
+      <div class="flex justify-end space-x-2 pt-2 border-t border-gray-800">
+        <button onclick="cancelEnrollProcess()" class="px-4 py-2 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs font-semibold transition">
+          Hủy Bỏ
+        </button>
+      </div>
+    </div>
   </div>
 
   <!-- Scripts tách riêng module hóa -->

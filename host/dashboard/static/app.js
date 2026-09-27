@@ -194,9 +194,23 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   // 7. Banner cảnh báo khẩn cấp toàn màn hình
+  let alertDismissedUntil = 0;
+
+  window.dismissAlertBanner = function() {
+    const banner = document.getElementById("critical-fullscreen-alert");
+    if (banner) banner.classList.add("hidden");
+    alertDismissedUntil = Date.now() + 15000; // Tạm tắt cảnh báo trong 15s
+    showToast("Đã tạm tắt cảnh báo trong 15 giây", "info");
+  };
+
   function toggleAlertBanner(band, drivers, action) {
     const banner = document.getElementById("critical-fullscreen-alert");
     if (!banner) return;
+
+    if (Date.now() < alertDismissedUntil) {
+      banner.classList.add("hidden");
+      return;
+    }
 
     if (band === "CRITICAL" || band === "ALARM") {
       banner.classList.remove("hidden");
@@ -214,7 +228,57 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  // 8. Tương tác gửi lệnh điều khiển (DASH-03 Ready)
+  // 8. Quy trình Hiệu Chuẩn Cá Nhân Hóa Lái Xe 60 Giây (DASH-03 / EXP-01)
+  let enrollTimer = null;
+  let enrollRemainingSeconds = 60;
+
+  window.startEnrollProcess = async function() {
+    const modal = document.getElementById("enroll-modal");
+    if (!modal) return;
+
+    // Gửi lệnh enroll xuống thiết bị IoT
+    await window.sendSystemCommand("enroll");
+
+    enrollRemainingSeconds = 60;
+    updateEnrollUi(60);
+    modal.classList.remove("hidden");
+
+    if (enrollTimer) clearInterval(enrollTimer);
+
+    enrollTimer = setInterval(() => {
+      enrollRemainingSeconds--;
+      updateEnrollUi(enrollRemainingSeconds);
+
+      if (enrollRemainingSeconds <= 0) {
+        clearInterval(enrollTimer);
+        enrollTimer = null;
+        modal.classList.add("hidden");
+        showToast("Hiệu chuẩn lái xe 60s hoàn tất thành công!", "success");
+      }
+    }, 1000);
+  };
+
+  window.cancelEnrollProcess = function() {
+    const modal = document.getElementById("enroll-modal");
+    if (modal) modal.classList.add("hidden");
+    if (enrollTimer) {
+      clearInterval(enrollTimer);
+      enrollTimer = null;
+    }
+    showToast("Đã hủy bỏ quy trình hiệu chuẩn", "info");
+  };
+
+  function updateEnrollUi(remainingSec) {
+    const countdownEl = document.getElementById("enroll-countdown");
+    const progressEl = document.getElementById("enroll-progress-bar");
+    if (countdownEl) countdownEl.textContent = `${remainingSec}s`;
+    if (progressEl) {
+      const pct = Math.round(((60 - remainingSec) / 60) * 100);
+      progressEl.style.width = `${pct}%`;
+    }
+  }
+
+  // 9. Tương tác gửi lệnh điều khiển (DASH-03 Ready)
   window.sendSystemCommand = async function(cmd, extra = {}) {
     try {
       const resp = await fetch("/api/cmd", {
@@ -224,7 +288,17 @@ document.addEventListener("DOMContentLoaded", () => {
       });
       const result = await resp.json();
       if (resp.ok) {
-        showToast(`Đã gửi lệnh: ${cmd.toUpperCase()}`, "success");
+        if (cmd === "unlock") {
+          // Cập nhật ngay trạng thái mở khóa trên UI
+          const lockElem = document.getElementById("engine-lock-status");
+          if (lockElem) {
+            lockElem.textContent = "HOẠT ĐỘNG";
+            lockElem.className = "px-3 py-1 rounded-full text-xs font-bold bg-emerald-600/20 text-emerald-400 border border-emerald-500/40";
+          }
+          showToast("Đã mở khóa động cơ thành công!", "success");
+        } else {
+          showToast(`Đã gửi lệnh: ${cmd.toUpperCase()}`, "success");
+        }
       } else {
         showToast(`Lỗi: ${result.detail || "Không thể gửi lệnh"}`, "error");
       }

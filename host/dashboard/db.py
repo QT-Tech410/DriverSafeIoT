@@ -9,10 +9,10 @@ Chịu trách nhiệm quản lý cơ sở dữ liệu SQLite:
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any
 
 from models import EventRecord, TelemetryRecord
 
@@ -29,14 +29,19 @@ class Database:
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        """Tạo kết nối SQLite an toàn với row_factory."""
+        """Tạo kết nối SQLite an toàn với row_factory.
+
+        Lưu ý: ``with conn:`` của SQLite chỉ commit/rollback, KHÔNG đóng kết
+        nối. Caller phải dùng ``contextlib.closing`` hoặc đóng tay để rò rỉ
+        connection không làm đầy connection pool.
+        """
         conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10.0)
         conn.row_factory = sqlite3.Row
         return conn
 
     def _init_db(self) -> None:
         """Tạo bảng và các index nếu chưa tồn tại, bật chế độ WAL."""
-        with self._get_connection() as conn:
+        with contextlib.closing(self._get_connection()) as conn:
             cursor = conn.cursor()
             # Bật Write-Ahead Logging để đọc/ghi đồng thời không khóa DB
             cursor.execute("PRAGMA journal_mode=WAL;")
@@ -90,9 +95,9 @@ class Database:
             conn.commit()
 
     def insert_telemetry(self, record: TelemetryRecord) -> int:
-        """Lưu một bản ghi telemetry 1Hz vào bảng telemetry."""
-        drivers_json = json.dumps(record.drivers, ensure_ascii=False)
-        with self._get_connection() as conn:
+        """Lưu một bản ghi telemetry vào bảng telemetry (kiểu dữ liệu an toàn)."""
+        drivers_json = json.dumps(list(record.drivers), ensure_ascii=False)
+        with contextlib.closing(self._get_connection()) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -130,7 +135,7 @@ class Database:
     def insert_event(self, record: EventRecord) -> int:
         """Lưu một bản ghi sự kiện rủi ro vào bảng events."""
         details_json = json.dumps(record.details, ensure_ascii=False)
-        with self._get_connection() as conn:
+        with contextlib.closing(self._get_connection()) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -151,9 +156,34 @@ class Database:
             conn.commit()
             return cursor.lastrowid or 0
 
+    @staticmethod
+    def _row_to_telemetry(r: sqlite3.Row) -> TelemetryRecord:
+        """Chuyển 1 hàng SQLite thành TelemetryRecord (dùng chung cho mọi query)."""
+        return TelemetryRecord(
+            id=r["id"],
+            ts=r["ts"],
+            risk=r["risk"],
+            band=r["band"],
+            drivers=json.loads(r["drivers"] or "[]"),
+            action=r["action"],
+            perclos_60s=r["perclos_60s"],
+            ear=r["ear"],
+            cles_dur_ms=r["cles_dur_ms"],
+            mar=r["mar"],
+            yawn_per_min=r["yawn_per_min"],
+            head_pitch_deg=r["head_pitch_deg"],
+            head_drop=bool(r["head_drop"]),
+            alcohol_g_l=r["alcohol_g_l"],
+            alco_level=r["alco_level"],
+            temp_c=r["temp_c"],
+            lux_mode=r["lux_mode"],
+            ldr_pct=r["ldr_pct"],
+            rssi=r["rssi"],
+        )
+
     def get_recent_telemetry(self, limit: int = 60) -> list[TelemetryRecord]:
         """Lấy N bản ghi telemetry gần nhất (mặc định 60 điểm cho biểu đồ 1 phút)."""
-        with self._get_connection() as conn:
+        with contextlib.closing(self._get_connection()) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -163,36 +193,12 @@ class Database:
             )
             rows = cursor.fetchall()
 
-        results: list[TelemetryRecord] = []
-        for r in reversed(rows):  # Trả về theo thứ tự thời gian tăng dần
-            results.append(
-                TelemetryRecord(
-                    id=r["id"],
-                    ts=r["ts"],
-                    risk=r["risk"],
-                    band=r["band"],
-                    drivers=json.loads(r["drivers"] or "[]"),
-                    action=r["action"],
-                    perclos_60s=r["perclos_60s"],
-                    ear=r["ear"],
-                    cles_dur_ms=r["cles_dur_ms"],
-                    mar=r["mar"],
-                    yawn_per_min=r["yawn_per_min"],
-                    head_pitch_deg=r["head_pitch_deg"],
-                    head_drop=bool(r["head_drop"]),
-                    alcohol_g_l=r["alcohol_g_l"],
-                    alco_level=r["alco_level"],
-                    temp_c=r["temp_c"],
-                    lux_mode=r["lux_mode"],
-                    ldr_pct=r["ldr_pct"],
-                    rssi=r["rssi"],
-                )
-            )
-        return results
+        # Trả về theo thứ tự thời gian tăng dần
+        return [self._row_to_telemetry(r) for r in reversed(rows)]
 
     def get_recent_events(self, limit: int = 50) -> list[EventRecord]:
         """Lấy danh sách N sự kiện rủi ro mới nhất."""
-        with self._get_connection() as conn:
+        with contextlib.closing(self._get_connection()) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -202,25 +208,37 @@ class Database:
             )
             rows = cursor.fetchall()
 
-        results: list[EventRecord] = []
-        for r in rows:
-            results.append(
-                EventRecord(
-                    id=r["id"],
-                    ts=r["ts"],
-                    source=r["source"],
-                    event_name=r["event_name"],
-                    risk=r["risk"],
-                    band=r["band"],
-                    action=r["action"],
-                    details=json.loads(r["details"] or "{}"),
-                )
+        return [
+            EventRecord(
+                id=r["id"],
+                ts=r["ts"],
+                source=r["source"],
+                event_name=r["event_name"],
+                risk=r["risk"],
+                band=r["band"],
+                action=r["action"],
+                details=json.loads(r["details"] or "{}"),
             )
-        return results
+            for r in rows
+        ]
+
+    def get_all_telemetry(self, limit: int = 5000) -> list[TelemetryRecord]:
+        """Lấy toàn bộ lịch sử telemetry (tối đa N bản ghi) để phân tích hoặc xuất CSV (DASH-04)."""
+        with contextlib.closing(self._get_connection()) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM telemetry ORDER BY ts ASC LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = cursor.fetchall()
+
+        return [self._row_to_telemetry(r) for r in rows]
 
     def get_counts(self) -> dict[str, int]:
         """Đếm số bản ghi trong các bảng để kiểm tra persistence."""
-        with self._get_connection() as conn:
+        with contextlib.closing(self._get_connection()) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM telemetry;")
             t_count = cursor.fetchone()[0]

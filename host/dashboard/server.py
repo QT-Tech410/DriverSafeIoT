@@ -16,12 +16,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import asynccontextmanager
+import csv
+from datetime import datetime, timezone
+import io
 from pathlib import Path
 import sys
+import time
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
@@ -80,12 +84,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware hỗ trợ test local
+# CORS: giới hạn origin thay vì wildcard, vì dashboard điều khiển thiết bị IoT.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -96,7 +100,6 @@ class CommandRequest(BaseModel):
     cmd: str
     n: int | None = None
     sig: str | None = None
-
 
 @app.get("/api/status")
 async def get_system_status() -> dict:
@@ -111,22 +114,88 @@ async def get_system_status() -> dict:
 @app.get("/api/telemetry/recent")
 async def get_recent_telemetry(limit: int = 60) -> list[dict]:
     """Lấy N bản ghi telemetry gần nhất (mặc định 60 điểm thời gian thực)."""
-    records = db.get_recent_telemetry(limit=min(limit, 300))
+    records = db.get_recent_telemetry(limit=max(1, min(limit, 300)))
     return [r.as_dict() for r in records]
 
 
 @app.get("/api/events")
 async def get_recent_events(limit: int = 50) -> list[dict]:
     """Lấy danh sách các sự kiện rủi ro đã ghi nhận."""
-    records = db.get_recent_events(limit=min(limit, 200))
+    records = db.get_recent_events(limit=max(1, min(limit, 200)))
     return [r.as_dict() for r in records]
+
+
+def _csv_escape(value: object) -> str:
+    """Chống CSV formula injection: tiền tố bằng nháy đơn và escape CR/LF/tab.
+
+    Excel/LibreOffice diễn giải ô bắt đầu bằng ``=``/``+``/``-``/``@``/tab như
+    một công thức. Dùng cho mọi trường xuất ra file CSV tải xuống.
+    """
+    text = "" if value is None else str(value)
+    if text.startswith(("=", "+", "-", "@", "\t")):
+        text = "'" + text
+    return text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+
+
+@app.get("/api/history/export")
+async def export_history_csv(limit: int = 5000) -> Response:
+    """Xuất dữ liệu lịch sử telemetry dưới dạng file CSV để phân tích và báo cáo (DASH-04)."""
+    records = db.get_all_telemetry(limit=max(1, min(limit, 10000)))
+
+    # BOM UTF-8 để Excel/LibreOffice đọc đúng dấu tiếng Việt.
+    output = io.StringIO()
+    writer = csv.writer(output)
+    # Header chuẩn của dữ liệu lịch sử telemetry
+    writer.writerow([
+        "timestamp_ms", "datetime_iso", "risk_score", "band", "action", "drivers",
+        "perclos_60s", "ear", "cles_dur_ms", "mar", "yawn_per_min",
+        "head_pitch_deg", "head_drop", "alcohol_g_l", "alco_level",
+        "temp_c", "lux_mode", "ldr_pct", "rssi"
+    ])
+    for r in records:
+        iso_str = datetime.fromtimestamp(r.ts / 1000.0, tz=timezone.utc).isoformat()
+        writer.writerow([
+            _csv_escape(r.ts), _csv_escape(iso_str), _csv_escape(r.risk),
+            _csv_escape(r.band), _csv_escape(r.action), _csv_escape(";".join(r.drivers)),
+            _csv_escape(r.perclos_60s), _csv_escape(r.ear), _csv_escape(r.cles_dur_ms),
+            _csv_escape(r.mar), _csv_escape(r.yawn_per_min),
+            _csv_escape(r.head_pitch_deg), _csv_escape(1 if r.head_drop else 0),
+            _csv_escape(r.alcohol_g_l), _csv_escape(r.alco_level),
+            _csv_escape(r.temp_c), _csv_escape(r.lux_mode), _csv_escape(r.ldr_pct),
+            _csv_escape(r.rssi)
+        ])
+
+    csv_data = output.getvalue()
+    filename = f"driversafe_telemetry_{int(time.time())}.csv"
+    return Response(
+        content=csv_data,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
 
 
 @app.post("/api/cmd")
 async def send_command(req: CommandRequest) -> dict:
-    """Gửi lệnh điều khiển (unlock, enroll, beep...) xuống ESP32 qua MQTT."""
+    """Gửi lệnh điều khiển (unlock, enroll, beep...) xuống ESP32 qua MQTT.
+
+    Whitelist an toàn: CHỈ dashboard được phát các lệnh an toàn. Lệnh ``lock``
+    (khóa động cơ) bị từ chối — chỉ Fusion Engine mới được khóa, và chỉ khi xác
+    nhận cồn 2/3 mẫu (FUS-04). Tránh để một client bất kỳ khóa xe đang chạy.
+    """
     if not mqtt_bridge or not mqtt_bridge.is_connected():
         raise HTTPException(status_code=503, detail="MQTT Broker chua ket noi, khong the gui lenh")
+
+    allowed = {"unlock", "beep", "enroll", "reset"}
+    if req.cmd not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Lenh khong hop le: {req.cmd!r}. Chi chap nhan: {sorted(allowed)}",
+        )
+    if req.n is not None and (req.n < 1 or req.n > 20):
+        raise HTTPException(status_code=400, detail="So lan beep phai nam trong khoang 1..20")
 
     cmd_dict = {"cmd": req.cmd}
     if req.n is not None:
@@ -195,12 +264,14 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="DriverSafe-IoT Dashboard Server (DASH-01)")
-    parser.add_argument("--host", default="127.0.0.1", help="Host lắng nghe (mặc định: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8000, help="Port lắng nghe (mặc định: 8000)")
+    parser.add_argument("--host", default="127.0.0.1", help="Host lang nghe (mac dinh: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8000, help="Port lang nghe (mac dinh: 8000)")
     args = parser.parse_args()
 
     print(f"[dashboard.server] Khoi chay FastAPI server tai http://{args.host}:{args.port}")
-    uvicorn.run("server:app", host=args.host, port=args.port, reload=False)
+    # Truyền đối tượng app trực tiếp (không dùng chuỗi "server:app") để không
+    # phụ thuộc sys.path/cwd và tránh re-import module khi chạy từ thư mục khác.
+    uvicorn.run(app, host=args.host, port=args.port, reload=False)
     return 0
 
 

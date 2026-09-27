@@ -5,7 +5,7 @@
 
 class DashboardCharts {
   constructor(fatigueCanvasId, cabinCanvasId) {
-    this.maxPoints = 45; // Lưu 45 giây gần nhất trên biểu đồ
+    this.maxPoints = 300; // Lưu 300 giây (5 phút gần nhất) theo spec DASH-04
 
     this.fatigueChart = this.initFatigueChart(fatigueCanvasId);
     this.cabinChart = this.initCabinChart(cabinCanvasId);
@@ -31,10 +31,18 @@ class DashboardCharts {
             fill: true,
           },
           {
-            label: "EAR (Mở mắt)",
+            label: "Risk Score (0-100)",
+            data: [],
+            borderColor: "#ef4444",
+            borderWidth: 2,
+            tension: 0.3,
+            yAxisID: "y1",
+          },
+          {
+            label: "EAR (Mắt)",
             data: [],
             borderColor: "#3b82f6",
-            borderWidth: 2,
+            borderWidth: 1.5,
             tension: 0.3,
             yAxisID: "y2",
           },
@@ -56,7 +64,7 @@ class DashboardCharts {
             type: "linear",
             position: "left",
             min: 0,
-            max: 50,
+            max: 100,
             grid: { color: "rgba(255, 255, 255, 0.05)" },
             ticks: { color: "#f59e0b", font: { size: 10 } },
           },
@@ -143,17 +151,19 @@ class DashboardCharts {
       second: "2-digit",
     });
 
-    // 1. Cập nhật Fatigue chart
+    // 1. Cập nhật Fatigue chart (PERCLOS, Risk Score, EAR)
     if (this.fatigueChart) {
       const fc = this.fatigueChart;
       fc.data.labels.push(timeLabel);
       fc.data.datasets[0].data.push((t.perclos_60s * 100).toFixed(1));
-      fc.data.datasets[1].data.push(t.ear.toFixed(3));
+      fc.data.datasets[1].data.push(Number(t.risk || 0).toFixed(1));
+      fc.data.datasets[2].data.push(t.ear.toFixed(3));
 
       if (fc.data.labels.length > this.maxPoints) {
         fc.data.labels.shift();
         fc.data.datasets[0].data.shift();
         fc.data.datasets[1].data.shift();
+        fc.data.datasets[2].data.shift();
       }
       fc.update();
     }

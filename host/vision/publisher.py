@@ -38,6 +38,7 @@ from face_metrics import (  # noqa: E402
     draw_status,
 )
 from temporal import (  # noqa: E402
+    DEFAULT_T_YAWN,
     Event,
     MetricsSnapshot,
     TemporalMetrics,
@@ -49,6 +50,7 @@ from config import (  # noqa: E402
     VisionTelemetryConfig,
     load_config,
 )
+from calibrate import DEFAULT_PROFILE_PATH, DriverProfile  # noqa: E402
 
 # Backward compatibility exports cho các script test / external callers
 TOPIC_VISION_METRICS = "ds/vision/metrics"
@@ -90,6 +92,10 @@ class VisionPublisher(mqtt.Client):
         self.event_publish_count = 0
         self.last_published_ts: float = 0.0
         self.current_lux_mode: str = "day"
+        # Ngưỡng cá nhân hóa từ driver_profile (EXP-01), dùng để chuyển ngày/đêm
+        self.t_closed_day: float = 0.22
+        self.t_closed_night: float = 0.22
+        self._profile_loaded = False
 
         # Topics từ config (liquid, spec-compliant)
         self.topic_telemetry = self.config.telemetry.topic
@@ -115,6 +121,24 @@ class VisionPublisher(mqtt.Client):
 
     def _handle_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None) -> None:
         print(f"[publisher] Da ngat ket noi khoi Mosquitto broker (code {reason_code})")
+
+    def apply_driver_profile(self, profile: DriverProfile) -> None:
+        """Áp dụng ngưỡng cá nhân hóa (EXP-01) cho publisher.
+
+        Đăng ký 2 ngưỡng T_closed day/night; publisher sẽ tự đổi theo lux_mode
+        mà ESP32 báo về (spec §6.4).
+        """
+        self.t_closed_day = float(profile.t_closed_day)
+        self.t_closed_night = float(profile.t_closed_night)
+        self._profile_loaded = True
+
+    def _sync_t_closed_to_lux(self, tm: "TemporalMetrics") -> None:
+        """Đổi T_closed theo điều kiện sáng hiện tại (spec §6.4)."""
+        if not self._profile_loaded:
+            return
+        target = self.t_closed_night if self.current_lux_mode == "night" else self.t_closed_day
+        if abs(tm.t_closed - target) > 1e-6:
+            tm.set_thresholds(t_closed=target)
 
     def _handle_message(self, client, userdata, msg) -> None:
         if msg.topic == self.topic_sensors:
@@ -266,15 +290,40 @@ def main(argv: list[str] | None = None) -> int:
         pub.disconnect_broker()
         return 1
 
-    initial_t_closed = args.t_closed if args.t_closed is not None else getattr(cfg.temporal, "T_CLOSED_SEC", 0.22)
-    tm = TemporalMetrics(t_closed=initial_t_closed)
+    # Khởi tạo ngưỡng cá nhân hóa: CLI > driver_profile.json (EXP-01) > config.yaml
+    profile = DriverProfile.load(DEFAULT_PROFILE_PATH)
+    profile_t_closed = profile.t_closed_day if profile is not None else None
+    profile_t_yawn = profile.t_yawn if profile is not None else None
+    profile_pitch = profile.pitch_neutral if profile is not None else None
+
+    initial_t_closed = args.t_closed if args.t_closed is not None else (
+        profile_t_closed if profile_t_closed is not None
+        else getattr(cfg.temporal, "T_CLOSED_SEC", 0.22)
+    )
+    tm = TemporalMetrics(
+        t_closed=initial_t_closed,
+        t_yawn=profile_t_yawn if profile_t_yawn is not None else DEFAULT_T_YAWN,
+        pitch_neutral=profile_pitch if profile_pitch is not None else 0.0,
+    )
     meter = FpsMeter()
     t_start = time.perf_counter()
     last_1hz_pub = t_start
     src_label = args.url if args.src == "mjpeg" else f"webcam[{args.index}]"
     recent_events: list[tuple[str, float]] = []
 
-    print(f"[publisher] Pipeline Vision san sang (Nguong EAR nham mat T_closed={tm.t_closed:.3f}).")
+    if profile is not None:
+        pub.apply_driver_profile(profile)
+        print(f"[publisher] Da nap driver_profile.json cua '{profile.driver_id}' "
+              f"(calib {profile.calibrated_at[:19]}Z, {profile.num_samples} mau):")
+        print(f"[publisher]   T_closed_day={profile.t_closed_day:.3f} | "
+              f"T_closed_night={profile.t_closed_night:.3f} | "
+              f"T_yawn={profile.t_yawn:.3f} | pitch_neutral={profile.pitch_neutral:+.1f}")
+    else:
+        print(f"[publisher] Chua co driver_profile.json ({DEFAULT_PROFILE_PATH}) — "
+              "dung nguong mac dinh. Chay calibrate.py de tao.")
+        print("[publisher] Phim tat [c] hoac [enroll] tu dashboard se tao profile rieng.")
+    print(f"[publisher] Pipeline Vision san sang (Nguong EAR nham mat T_closed={tm.t_closed:.3f}, "
+          f"T_yawn={tm.t_yawn:.3f}).")
     print("[publisher] Phim tat tren camera: [+] tang nguong, [-] giam nguong, [c] auto-calib mat, [q] thoat.")
 
     try:
@@ -287,6 +336,9 @@ def main(argv: list[str] | None = None) -> int:
             meter.tick()
             now = time.perf_counter()
             t_ms = (now - t_start) * 1000.0
+
+            # Áp dụng ngưỡng theo ánh sáng (ESP32 báo lux_mode, spec §6.4)
+            pub._sync_t_closed_to_lux(tm)
 
             # Xử lý FaceMesh và tính toán hình học
             result = mesh.process(frame, int(t_ms))
