@@ -31,7 +31,7 @@ T_FRAME_MS = 1000.0 / SAMPLE_HZ      # 100ms mỗi mẫu
 EYE_DEBOUNCE = 6                     # 6 mẫu (~200ms tại 30FPS / downsampled) vượt đỉnh chớp mắt tự nhiên
 EYE_OPEN_DEBOUNCE = 2                # 2 mẫu (~200ms tại 10Hz) khử nhiễu mở mắt (Release Debounce)
 EYE_CLOSURE_MS = 250.0               # CLES >= 250ms (nhắm mắt kéo dài)
-MICROSLEEP_MS = 1200.0               # >= 1200ms (1.2s - chu kỳ sinh học giấc ngủ trắng microsleep)
+MICROSLEEP_MS = 2000.0               # >= 1200ms (1.2s - chu kỳ sinh học giấc ngủ trắng microsleep)
 YAWN_MS = 400.0                      # MAR >= T_yawn >= 400ms (1 chu kỳ mở->khép)
 YAWN_CLOSE_DEBOUNCE = 2              # 2 mẫu (~200ms tại 10Hz) khử nhiễu khép miệng (Release Debounce)
 YAWN_FACE_LOST_TOLERANCE_MS = 1500.0 # Dung thứ mất mặt khi ngáp (che tay / ngửa cổ) tối đa 1.5s

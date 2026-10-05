@@ -23,3 +23,5 @@ experiments/out/
 
 # Model MediaPipe tải về (3.7 MB) — không commit, chạy: python scripts/fetch_models.py
 host/**/models/*.task
+/datasets
+/runs

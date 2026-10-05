@@ -55,6 +55,9 @@ class MqttBridge(mqtt.Client):
         ws_manager: WebSocketManager | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
+        if not client_id:
+                import uuid
+                client_id = f"dashboard_mqtt_{uuid.uuid4().hex[:6]}"
         if _CALLBACK_API is not None:
             super().__init__(_CALLBACK_API, client_id=client_id)
         else:  # pragma: no cover
